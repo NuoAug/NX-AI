@@ -1,0 +1,50 @@
+# Local environments, caches and temporary work
+.tmp/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.evidence/
+.runtime/
+
+# Local secrets and editor state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
+
+# Model and runtime assets are maintained locally via the asset manifest
+/NX-AI/Models/
+/NX-AI/Runtime/*
+!/NX-AI/Runtime/BUILD.md
+*.gguf
+*.onnx
+*.exe
+*.dll
+
+# Historical snapshots, recovery environments and raw operational evidence
+/Testbench/Checkpoints/
+/Testbench/Changes/
+/Testbench/Local_resume_*/
+/Testbench/Data/
+/Docs/报告/证据/
+# Real-speaker recordings remain local; synthetic audio fixtures may be committed
+/Tests/Fixtures/audio/speaker/
+/Tests/Fixtures/audio/questions/[0-9]*.wav
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Generated run data, logs and recordings
+logs/
+runs/
+uploads/
+recording/
+*.log
+*.jsonl.tmp

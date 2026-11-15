@@ -1,0 +1,27 @@
+{
+  "audio": {
+    "backend": "alsa",
+    "input_device": null,
+    "output_device": null,
+    "sample_rate": 16000,
+    "frame_ms": 20,
+    "aec_enabled": false
+  },
+  "models": {
+    "root": "/home/mylin/Desktop/Nuo/models"
+  },
+  "llm": {
+    "base_url": "http://127.0.0.1:8080",
+    "model": "qwen35",
+    "max_tokens": 512,
+    "request_timeout_s": 120.0
+  },
+  "contract": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 18700
+  },
+  "evidence_dir": "/home/mylin/Desktop/Nuo/evidence",
+  "log_dir": "/home/mylin/Desktop/Nuo/logs",
+  "evidence_mode": "live"
+}

@@ -1,0 +1,23 @@
+[project]
+name = "aieyes"
+version = "0.0.0"
+description = "AI_Eyes 视觉语言交互子系统（interaction.v0.1）"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "sounddevice>=0.4",
+    "sherpa-onnx>=1.10",
+    "piper-tts>=1.2",
+    "onnxruntime>=1.17",
+    "requests>=2.31",
+    "pillow>=10.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["Tests"]
+pythonpath = ["Src"]
+addopts = "-ra"
+markers = [
+    "target: 需要目标机模型/设备，电脑上跳过",
+    "slow: 长耗时用例",
+]
