@@ -23,9 +23,39 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "Src"))
+# Linux 区分大小写：仓库/交付根里实际叫 ``src/``，历史写法 ``Src/`` 只在 Windows
+# （不区分大小写）能命中。两个都探，命中即用，避免板上 import aieyes 直接失败。
+for _pkg_parent in (ROOT / "src", ROOT / "Src"):
+    if _pkg_parent.is_dir():
+        if str(_pkg_parent) not in sys.path:
+            sys.path.insert(0, str(_pkg_parent))
+        break
 
 import numpy as np  # noqa: E402
+
+# Windows 本机没有 POSIX 的 fcntl/termios/tty，而 aieyes.vision 在**导入期**就要
+# fcntl（camera.py 顶层 import）。这里只在真正缺失时补最小占位模块，让
+# ``--help``、峰值核算等本机入口可用；真实采样仍在目标板上做，不改变板上行为。
+# 顺序：tty 依赖 termios（真 tty 会读 TCSAFLUSH 等常量），先占位 tty 才不会踩到
+# 半成品 termios；termios/fcntl 各自独立。
+for _posix_name, _posix_attrs in (
+    ("tty", {"setraw": lambda *a, **k: None, "setcbreak": lambda *a, **k: None}),
+    ("termios", {"tcgetattr": lambda *a, **k: [], "tcsetattr": lambda *a, **k: 0,
+                 "TCSANOW": 0, "TCSAFLUSH": 0, "TCSADRAIN": 0,
+                 "ICANON": 0, "ECHO": 0, "VMIN": 0, "VTIME": 0}),
+    ("fcntl", {"ioctl": lambda *a, **k: 0, "flock": lambda *a, **k: None,
+               "fcntl": lambda *a, **k: 0, "LOCK_EX": 0, "LOCK_SH": 0,
+               "LOCK_UN": 0, "F_SETFL": 0, "F_GETFL": 0}),
+):
+    try:
+        __import__(_posix_name)
+    except Exception:  # noqa: BLE001 — ImportError 或半成品模块的 NameError 都要兜
+        import types as _types
+
+        _stub = _types.ModuleType(_posix_name)
+        for _k, _v in _posix_attrs.items():
+            setattr(_stub, _k, _v)
+        sys.modules[_posix_name] = _stub
 
 from aieyes.app import _make_scene  # noqa: E402
 from aieyes.audio.output import AudioSink  # noqa: E402
@@ -47,8 +77,31 @@ from aieyes.vision.vlm import VlmClient  # noqa: E402
 from aieyes.chat import ChatSession  # noqa: E402
 
 SAMPLE_RATE = 16000
-WAKE = ROOT / "Tests/Fixtures/audio/wake/tts_xiaobing_nihao.wav"
-QUESTION_DIR = ROOT / "Tests/Fixtures/audio/questions"
+
+
+def _pick_existing(candidates):
+    """返回第一个存在的候选路径；都不存在时返回首个候选（保留原有报错形态）。
+
+    目标板目录全小写（config/、tests/fixtures/），本机历史上用 Config/、Tests/Fixtures/；
+    两种布局都要能跑，所以默认值不接受硬编码的单一拼写。顺序 = 旧拼写优先，保持向后兼容。
+    """
+    for cand in candidates:
+        if Path(cand).exists():
+            return Path(cand)
+    return Path(candidates[0])
+
+
+WAKE = _pick_existing(
+    [
+        ROOT / "Tests/Fixtures/audio/wake/tts_xiaobing_nihao.wav",
+        ROOT / "tests/fixtures/audio/wake/tts_xiaobing_nihao.wav",
+    ]
+)
+QUESTION_DIR = _pick_existing(
+    [ROOT / "Tests/Fixtures/audio/questions", ROOT / "tests/fixtures/audio/questions"]
+)
+# 只认 argv[0] 的程序名，避免把命令行里带 llama-server 字样的无关进程算进来
+_SERVER_MARKER = b"llama-server"
 
 
 def _silence(ms: int) -> np.ndarray:
@@ -64,32 +117,85 @@ def _cycle_audio(wake: np.ndarray, question: np.ndarray) -> np.ndarray:
     return np.concatenate([wake, _silence(2000), question, _silence(24000)])
 
 
-def _proc_kb(field: str) -> int:
+def _proc_kb(field: str) -> int | None:
+    """读 /proc/self/status 的某个 kB 字段；缺字段/不可读/非法值返回 None。
+
+    不返回 0：0 kB 与“没读到”是两件事，把后者当 0 会让峰值看起来更小。
+    """
     try:
-        for line in Path("/proc/self/status").read_text().splitlines():
-            if line.startswith(field + ":"):
-                return int(line.split()[1])
+        text = Path("/proc/self/status").read_text()
     except OSError:
-        pass
-    return 0
+        return None
+    for line in text.splitlines():
+        if not line.startswith(field + ":"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return None
+        try:
+            value = int(parts[1])
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+    return None
 
 
-def _server_peak_kb() -> int:
-    import subprocess
-
+def _iter_proc_pids(proc_root: str | Path = "/proc") -> list[int]:
     try:
-        out = subprocess.run(
-            ["pgrep", "-f", "[l]lama-server"], capture_output=True, text=True, timeout=5
-        ).stdout.split()
-        if not out:
-            return 0
-        pid = out[0]
-        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        names = list(Path(proc_root).iterdir())
+    except OSError:
+        return []
+    return sorted(int(p.name) for p in names if p.name.isdigit())
+
+
+def _server_pids(proc_root: str | Path = "/proc") -> list[int]:
+    """按 /proc/<pid>/cmdline 的 argv[0] 归属 llama-server 进程。
+
+    不用 ``pgrep -f llama-server``：它匹配整条命令行，会把编辑器、grep、日志
+    查看这类进程算成模型进程；这里只认程序名（argv[0] 的 basename）。
+    """
+    pids: list[int] = []
+    for pid in _iter_proc_pids(proc_root):
+        try:
+            cmdline = (Path(proc_root) / str(pid) / "cmdline").read_bytes()
+        except OSError:
+            continue
+        argv0 = cmdline.split(b"\0", 1)[0].replace(b"\\", b"/")
+        if not argv0:
+            continue
+        if _SERVER_MARKER in argv0.rsplit(b"/", 1)[-1]:
+            pids.append(pid)
+    return sorted(pids)
+
+
+def _server_peak_kb(proc_root: str | Path = "/proc") -> int | None:
+    """所有 llama-server 进程 VmHWM 之和；一个都没找到或不可读 → None。
+
+    旧实现用 ``pgrep -f`` 只取第一个 pid，既可能命中无关进程，也会漏掉多进程；
+    失败时还静默返回 0，让峰值看起来达标。
+    """
+    pids = _server_pids(proc_root)
+    if not pids:
+        return None
+    total = 0
+    for pid in pids:
+        try:
+            text = (Path(proc_root) / str(pid) / "status").read_text()
+        except OSError:
+            return None
+        for line in text.splitlines():
             if line.startswith("VmHWM:"):
-                return int(line.split()[1])
-    except Exception:  # noqa: BLE001 - 观测，不影响主流程
-        pass
-    return 0
+                parts = line.split()
+                if len(parts) < 2:
+                    return None
+                try:
+                    total += int(parts[1])
+                except ValueError:
+                    return None
+                break
+        else:
+            return None
+    return total
 
 
 class NullSink:
@@ -214,6 +320,13 @@ def _read_records(path: Path) -> list[dict]:
     return records
 
 
+def _naive_sum_gib(*kb_values) -> float | None:
+    """RSS 朴素和换算成 GiB；任一分量未知即 None（不把缺测当 0 加起来）。"""
+    if any(value is None for value in kb_values):
+        return None
+    return round(sum(kb_values) / 1024 / 1024, 3)
+
+
 def _summarize(records: list[dict], elapsed_s: float, rss: dict, llama_peak_kb: int) -> dict:
     def find(category: str, event: str) -> list[dict]:
         return [r for r in records if r.get("category") == category and r.get("event") == event]
@@ -254,9 +367,24 @@ def _summarize(records: list[dict], elapsed_s: float, rss: dict, llama_peak_kb: 
             "p95": _pct(first_audio, 95),
             "max": max(first_audio) if first_audio else None,
         },
-        "proc_rss_peak_mib": round(rss.get("peak_kb", 0) / 1024, 1),
-        "server_peak_mib": round(llama_peak_kb / 1024, 1),
-        "stack_peak_gib": round((rss.get("peak_kb", 0) + llama_peak_kb) / 1024 / 1024, 3),
+        "proc_rss_peak_mib": None if rss.get("peak_kb") is None else round(rss["peak_kb"] / 1024, 1),
+        "server_peak_mib": None if llama_peak_kb is None else round(llama_peak_kb / 1024, 1),
+        # RSS 朴素和：只是筛查量，既不含共享页去重，也不含 NvMap 与子进程，
+        # 单独不能支撑“峰值 ≤ 4 GiB”的结论（见 stack_peak_gib_* 标签）。
+        "stack_peak_gib": _naive_sum_gib(rss.get("peak_kb"), llama_peak_kb),
+        "stack_peak_gib_method": "rss_naive_sum_screening_only",
+        "stack_peak_gib_is_conclusion": False,
+        "stack_peak_gib_scope": "probe_process_plus_llama_server_rss_only",
+        "stack_peak_gib_caveats": [
+            "no_shared_page_dedup_pss_not_used",
+            "nvmap_gpu_buffers_not_included",
+            "child_processes_of_probe_not_included",
+            "swap_and_zram_policy_not_verified_here",
+        ],
+        "rss_sample_counts": {
+            "samples": int(rss.get("samples", 0)),
+            "missing_samples": int(rss.get("missing_samples", 0)),
+        },
         "evidence_lines": len(records),
     }
 
@@ -289,7 +417,14 @@ async def _run(args: argparse.Namespace) -> int:
     cfg = AppConfig.from_file(args.config)
     # 回放环境：场景问答走文件图，避免占用真实相机
     cfg.vision.backend = "file"
-    cfg.vision.file_source = str(ROOT / "Tests/Fixtures/images/text_cn_price.png")
+    cfg.vision.file_source = str(
+        _pick_existing(
+            [
+                ROOT / "Tests/Fixtures/images/text_cn_price.png",
+                ROOT / "tests/fixtures/images/text_cn_price.png",
+            ]
+        )
+    )
     base = Path(cfg.evidence_dir)
     out = Path(args.out) if args.out else base / "soak" / f"soak_{int(time.time())}.json"
     evidence_path = base / "soak" / "soak.jsonl"
@@ -333,7 +468,7 @@ async def _run(args: argparse.Namespace) -> int:
         evidence=evidence,
     )
 
-    rss = {"peak_kb": 0}
+    rss = {"peak_kb": None, "samples": 0, "missing_samples": 0}
     stop_at = mono_ms() + int(args.minutes * 60 * 1000)
     started = mono_ms()
 
@@ -344,11 +479,16 @@ async def _run(args: argparse.Namespace) -> int:
     while mono_ms() < stop_at:
         await asyncio.sleep(15)
         cur = _proc_kb("VmRSS")
-        if cur > rss["peak_kb"]:
-            rss["peak_kb"] = cur
+        if cur is None:
+            rss["missing_samples"] += 1
+        else:
+            rss["samples"] += 1
+            if rss["peak_kb"] is None or cur > rss["peak_kb"]:
+                rss["peak_kb"] = cur
         # 让出事件循环，保持心跳可观测
+        rss_text = "?" if cur is None else f"{cur / 1024:7.1f}"
         print(
-            f"  t={int((mono_ms() - started) / 1000):4d}s rss={cur / 1024:7.1f}MiB "
+            f"  t={int((mono_ms() - started) / 1000):4d}s rss={rss_text}MiB "
             f"wakes={len([r for r in _read_records(evidence_path) if r.get('category') == 'wake'])}"
         )
 
@@ -376,7 +516,14 @@ async def _run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="30 分钟持续交互检查（回放输入）")
-    parser.add_argument("--config", default=str(ROOT / "Config/target.json"))
+    parser.add_argument(
+        "--config",
+        default=str(
+            _pick_existing(
+                [ROOT / "Config/target.json", ROOT / "config/target.json"]
+            )
+        ),
+    )
     parser.add_argument("--minutes", type=float, default=30.0)
     parser.add_argument(
         "--sink",
@@ -384,7 +531,7 @@ def main() -> int:
         default="auto",
         help="auto=优先真实声卡，失败退回 null；null=不出声（无声卡环境）",
     )
-    parser.add_argument("--questions-dir", default="", help="问题素材目录（默认 Tests/Fixtures/audio/questions）")
+    parser.add_argument("--questions-dir", default="", help="问题素材目录（默认 Tests/Fixtures/audio/questions，缺失时回退 tests/fixtures/audio/questions）")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
     return asyncio.run(_run(args))

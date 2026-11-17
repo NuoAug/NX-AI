@@ -99,6 +99,8 @@ class AsrConfig:
     decoding_method: str = "greedy_search"
     model_type: str = "paraformer"
     reset_on_silence_ms: int = 600
+    # 开口后连续静音帧不再喂给流式模型：长停顿会让 Paraformer 重复/吞字。
+    silence_skip_rms: float = 0.003
 
 
 @dataclass
@@ -109,6 +111,14 @@ class TtsConfig:
     noise_scale: float = 0.667
     noise_w: float = 0.8
     max_segment_chars: int = 60  # 长文本按标点切段，保证首声时延
+    #: 固定提醒的预生成音色缓存目录（index.json + *.wav），空=不启用。
+    #: 缓存是离线 WAV，运行时不联网、不调用 edge-tts。
+    fixed_cache_dir: str = ""
+    #: 固定提醒使用的音色标识（只用于核对缓存清单，不参与合成）。
+    fixed_voice_id: str = "zh-CN-XiaoxiaoNeural"
+    #: 输出响度对齐：参考试听 RMS -19 dBFS、峰值 -3.4 dBFS；峰值上限留 3dB 余量。
+    target_rms_dbfs: float = -19.0
+    peak_ceiling_dbfs: float = -1.0
 
 
 @dataclass

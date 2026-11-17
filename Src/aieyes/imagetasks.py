@@ -47,6 +47,7 @@ class EvidenceGroup:
     captures: int = 0
     max_images: int = 2
     max_captures: int = 3
+    released: bool = False
 
     @property
     def expired(self) -> bool:
@@ -86,6 +87,13 @@ class CompareTask:
     b_frame_id: str = ""
     frames: dict[str, object] = field(default_factory=dict, repr=False)
     pause_reason: str = ""
+    #: 位置级取图次数（A/B），**跨证据组**延续：换物/重拍换新组也不回到 0
+    #: （功能说明「拍摄预算与有限失败处理」「7.6-5」：每位置总拍摄 3 次不因换面、
+    #: 换物或失败原因变化重置）。
+    position_captures: dict[str, int] = field(default_factory=dict)
+    #: 任务结束（answered/failed/closed）时刻；用于判断「刚才那两件」是否还值得
+    #: 直接复用，避免很久以后又把旧比较结果当成当前画面。
+    finished_ms: int = 0
 
     @property
     def finished(self) -> bool:
@@ -155,6 +163,12 @@ class ImageTaskStore:
         self._seq = itertools.count(1)
         self.tasks: list[CompareTask] = []
         self.groups: list[EvidenceGroup] = []
+        # 单目标（不走双图任务）的取图额度：按「图片任务」窗口延续，
+        # 换问法/翻面/换物都不重置（功能说明「拍摄预算与有限失败处理」：
+        # 单目标采集最多 3 次、不能通过换问法重置原图时间或拍摄次数）。
+        self._single_captures = 0
+        self._single_started_ms: int | None = None
+        self._target_group: EvidenceGroup | None = None
 
     # -- 任务 ---------------------------------------------------------
     def unfinished(self) -> list[CompareTask]:
@@ -205,24 +219,33 @@ class ImageTaskStore:
         task.a_frame_id = a_frame_id
         task.b_frame_id = b_frame_id
         task.state = "answered"
+        task.finished_ms = self._now()
         self._release_groups(task)
 
     def close(self, task: CompareTask, *, reason: str = "closed") -> None:
         task.state = "closed"
         task.pause_reason = reason
+        task.finished_ms = self._now()
         self._release_groups(task)
 
     def _release_groups(self, task: CompareTask) -> None:
         """完成/取消时只放下本次引用（组本身留给历史缓存/其他任务）。"""
+        held = {
+            id(group)
+            for other in self.unfinished()
+            if other is not task
+            for group in (other.group_a, other.group_b)
+            if group is not None
+        }
         for group in (task.group_a, task.group_b):
-            if group is not None and group not in [t.group_a for t in self.unfinished()] + [
-                t.group_b for t in self.unfinished()
-            ]:
-                pass  # 组保留在 self.groups 供历史复用；引用由 task 字段体现
+            if group is None or id(group) in held:
+                continue
+            # 放下容量占用，但保留在 self.groups：历史追问仍可引用其 image_ids。
+            group.released = True
 
     # -- 证据组 -------------------------------------------------------
     def new_group(self, task: CompareTask, *, position: str, source: str) -> EvidenceGroup:
-        live = [group for group in self.groups if not group.expired]
+        live = [group for group in self.groups if not group.expired and not group.released]
         if len(live) >= self.max_groups:
             raise CapacityError(
                 "已经有两组图了，要用新图得先放下旧的一组",
@@ -245,18 +268,225 @@ class ImageTaskStore:
             task.group_b = group
         return group
 
-    def record_capture(self, task: CompareTask, group: EvidenceGroup, frame_id: str) -> dict[str, object]:
-        """登记一次成功取图：扣该位置次数、必要时启动 T08。"""
+    def record_capture(
+        self,
+        task: CompareTask | None,
+        group: EvidenceGroup,
+        frame_id: str,
+    ) -> dict[str, object]:
+        """登记一次成功取图：扣该位置次数、必要时启动 T08（历史图引用两者都不做）。
+
+        ``task`` 为 ``None`` 表示单目标取图（不走双图任务）：额度记在 store 上，
+        按「图片任务」窗口延续，换问法不重置。
+        """
+        if group.source == "history":
+            # 模块约定：只分析历史图不扣次数、不启动 T08；仍留下证据引用。
+            if frame_id not in group.image_ids:
+                group.image_ids.append(frame_id)
+                if len(group.image_ids) > group.max_images:
+                    group.image_ids.pop(0)
+            return {
+                "group_id": group.group_id,
+                "position": group.position,
+                "frame_id": frame_id,
+                "captures": group.captures,
+                "remaining_captures": group.remaining_captures,
+                "t08_deadline_ms": None if task is None else task.t08_deadline_ms,
+            }
+        if task is None:
+            return self.record_single_capture(frame_id, group=group)
+        # 位置额度以任务级计数为准：换物/重拍换了新组也不能回到 3 次。
+        used = max(task.position_captures.get(group.position, 0), group.captures)
+        if used >= self.max_captures_per_position:
+            raise ImageTaskError(f"位置 {group.position} 的取图次数已用尽")
         group.add_frame(frame_id)
+        task.position_captures[group.position] = used + 1
         if task.t08_deadline_ms is None:
             task.t08_deadline_ms = self._now() + self.t08_ms
         return {
             "group_id": group.group_id,
             "position": group.position,
             "frame_id": frame_id,
-            "captures": group.captures,
-            "remaining_captures": group.remaining_captures,
+            "captures": task.position_captures[group.position],
+            "remaining_captures": max(0, self.max_captures_per_position - used - 1),
             "t08_deadline_ms": task.t08_deadline_ms,
+        }
+
+    # -- 位置占用释放（重拍 / 换物 / 翻面）-----------------------------
+    def release_position(self, task: CompareTask, position: str) -> dict[str, object]:
+        """让某位置的**当前证据**退出使用，另一位置保持不动。
+
+        只放下「位置占用」：证据组仍留在 :attr:`groups` 里（历史追问还能引用它的
+        ``image_ids``，功能说明 L463），帧对象原样返回给调用方而不是销毁；下次该位置
+        需要出图时重新 ``new_group`` + 取图。位置额度（``position_captures``）保留，
+        重拍不退回次数（7.6-3/7.6-5）。
+        """
+        if position not in ("A", "B"):
+            raise ImageTaskError(f"未知位置：{position!r}")
+        group = task.group_a if position == "A" else task.group_b
+        frame = task.frames.pop(position, None)
+        if position == "A":
+            task.group_a = None
+        else:
+            task.group_b = None
+        if group is not None:
+            group.released = True
+        # 该位置要重新准备：完成一次取图后确需翻面/换物，可建新的准备阶段（L200）。
+        task.t08_deadline_ms = None
+        used = task.position_captures.get(position, 0)
+        return {
+            "task_id": task.task_id,
+            "position": position,
+            "released_group": "" if group is None else group.group_id,
+            "frame": frame,
+            "captures": used,
+            "remaining_captures": max(0, self.max_captures_per_position - used),
+            "t08_deadline_ms": task.t08_deadline_ms,
+        }
+
+    # -- 只读访问器：给上层实现"复用上次那张图"（C6 历史图引用）-------
+    def group(self, group_id: str) -> EvidenceGroup | None:
+        """按 id 取证据组（只读；已释放/已过期的组仍可取，便于追溯）。"""
+        for group in self.groups:
+            if group.group_id == group_id:
+                return group
+        if self._target_group is not None and self._target_group.group_id == group_id:
+            return self._target_group
+        return None
+
+    def _task_id_of(self, group: EvidenceGroup) -> str:
+        for task in self.tasks:
+            if task.group_a is group or task.group_b is group:
+                return task.task_id
+        return ""
+
+    def _evidence_row(self, group: EvidenceGroup) -> dict[str, object]:
+        return {
+            "frame_id": group.image_ids[-1] if group.image_ids else "",
+            "group_id": group.group_id,
+            "position": group.position,
+            "source": group.source,
+            "created_ms": group.created_ms,
+            "task_id": self._task_id_of(group),
+            "captures": group.captures,
+            "image_ids": list(group.image_ids),
+            "released": group.released,
+        }
+
+    def latest_evidence(self, position: str | None = None) -> dict[str, object] | None:
+        """最近一张可用证据（按证据组创建顺序取最新、未释放、未过期的那组）。
+
+        ``position`` 传 ``"A"``/``"B"`` 只取该位置；传 ``"S"`` 取单目标；``None`` 不限。
+        上层据此判断"上次那张"能不能复用（帧对象仍需调用方自持 `frame_id → frame`）。
+        """
+        rows = [
+            (index, group)
+            for index, group in enumerate(self.groups)
+            if group.image_ids
+            and not group.expired
+            and not group.released
+            and (position is None or group.position == position)
+        ]
+        if position in (None, "S") and self._target_group is not None:
+            target = self._target_group
+            if target.image_ids and not target.expired and not target.released:
+                rows.append((len(self.groups), target))
+        if not rows:
+            return None
+        # 同一毫秒内建的组按入列顺序区分先后（时间戳可能相等）。
+        _, newest = max(rows, key=lambda item: (item[1].created_ms, item[0]))
+        return self._evidence_row(newest)
+
+    def history_index(self, *, limit: int = 8) -> list[dict[str, object]]:
+        """证据索引（按创建时间倒序），含已释放组：上层用来找"上一个任务留下的图"。"""
+        rows = [
+            (index, group)
+            for index, group in enumerate(self.groups)
+            if group.image_ids and not group.expired
+        ]
+        if self._target_group is not None and self._target_group.image_ids:
+            target = self._target_group
+            if not target.expired:
+                rows.append((len(self.groups), target))
+        rows.sort(key=lambda item: (item[1].created_ms, item[0]), reverse=True)
+        return [self._evidence_row(group) for _, group in rows[: max(0, limit)]]
+
+    # -- 单目标（不建双图任务）的取图额度 ------------------------------
+    def _single_roll_if_window_over(self) -> None:
+        """图片任务窗口（默认 15 分钟）过去后，单目标额度视为新任务重新起算。"""
+        if self._single_started_ms is None:
+            return
+        if self._now() - self._single_started_ms < self.task_deadline_ms:
+            return
+        self._single_captures = 0
+        self._single_started_ms = None
+        self._target_group = None
+
+    @property
+    def single_target_captures(self) -> int:
+        self._single_roll_if_window_over()
+        return self._single_captures
+
+    @property
+    def single_target_remaining(self) -> int:
+        return max(0, self.max_captures_per_position - self.single_target_captures)
+
+    @property
+    def single_target_budget_exhausted(self) -> bool:
+        return self.single_target_remaining == 0
+
+    def target_budget_exhausted(self, *, source: str = "camera") -> bool:
+        """单目标还有没有取图次数（上层在**发出取图请求之前**问这个）。"""
+        del source  # 目前 file/camera 共用同一份额度，保留参数以便上层统一传参
+        return self.single_target_budget_exhausted
+
+    def current_target_group(self, *, source: str = "camera") -> EvidenceGroup:
+        """单目标当前证据组（惰性创建；不占双图的两组容量）。"""
+        self._single_roll_if_window_over()
+        group = self._target_group
+        if group is None or group.expired or group.released:
+            now = self._now()
+            group = EvidenceGroup(
+                group_id=f"grp-{next(self._seq):03d}",
+                position="S",
+                source=source,
+                created_ms=now,
+                deadline_ms=now + self.group_deadline_ms,
+                max_images=self.max_images_per_group,
+                max_captures=self.max_captures_per_position,
+            )
+            self._target_group = group
+        group.captures = self._single_captures
+        return group
+
+    def record_single_capture(
+        self,
+        frame_id: str,
+        *,
+        group: EvidenceGroup | None = None,
+    ) -> dict[str, object]:
+        """登记一次单目标实际取图（发出请求即计一次，失败/超时/重拍都算）。"""
+        self._single_roll_if_window_over()
+        if self._single_captures >= self.max_captures_per_position:
+            raise ImageTaskError(
+                f"目标 的取图次数已用尽（每目标最多 {self.max_captures_per_position} 次）"
+            )
+        group = group or self.current_target_group()
+        self._single_captures += 1
+        if self._single_started_ms is None:
+            self._single_started_ms = self._now()
+        if frame_id and frame_id not in group.image_ids:
+            group.image_ids.append(frame_id)
+            if len(group.image_ids) > group.max_images:
+                group.image_ids.pop(0)
+        group.captures = self._single_captures
+        return {
+            "group_id": group.group_id,
+            "position": group.position,
+            "frame_id": frame_id,
+            "captures": self._single_captures,
+            "remaining_captures": max(0, self.max_captures_per_position - self._single_captures),
+            "t08_deadline_ms": None,
         }
 
     def clear_all(self) -> dict[str, int]:
@@ -266,7 +496,11 @@ class ImageTaskStore:
         frames = sum(len(task.frames) for task in self.tasks)
         self.tasks.clear()
         self.groups.clear()
+        self._single_captures = 0
+        self._single_started_ms = None
+        self._target_group = None
         return {"tasks": tasks, "groups": groups, "frames": frames}
+
 
     def cleanup(self) -> None:
         """清掉已过期且不再被未完成任务引用的组。"""

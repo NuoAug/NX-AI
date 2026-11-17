@@ -1,4 +1,4 @@
-"""Testbench/media.py 单测：全部使用 fake camera 与临时目录，不碰真实设备。"""
+"""testbench/media.py 单测：全部使用 fake camera 与临时目录，不碰真实设备。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-for _path in (str(_REPO_ROOT / "Testbench"), str(_REPO_ROOT / "Src")):
+for _path in (str(_REPO_ROOT / "testbench"), str(_REPO_ROOT / "src")):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
@@ -262,6 +262,25 @@ class CameraHubTests(unittest.TestCase):
         self.assertEqual(frame.width, 64)
         self.assertIsNone(hub.status()["error"])
         hub.remove_ref("task")
+
+    def test_camera_is_reopened_after_repeated_grab_failures(self) -> None:
+        camera = FakeCamera(interval=0.005)
+        camera.fail_always = True
+        hub = self.make_hub(camera)
+        hub.add_ref("task")
+        # 连续失败到阈值必须释放已失效的句柄并重开，否则断连后画面永远回不来。
+        self.assertTrue(
+            wait_until(lambda: camera.close_count >= 1 and camera.open_count >= 2, 4.0),
+            (camera.open_count, camera.close_count, hub.status()),
+        )
+        self.assertTrue(hub.status()["active"])
+        camera.fail_always = False
+        frame = hub.wait_newer_than(0, 6000)
+        self.assertEqual(frame.width, 64)
+        self.assertIsNone(hub.status()["error"])
+        self.assertTrue(hub.status()["camera_open"])
+        hub.remove_ref("task")
+        self.assertGreaterEqual(camera.close_count, 1)
 
     def test_adapter_returns_progressive_new_frames(self) -> None:
         camera = FakeCamera(interval=0.005)

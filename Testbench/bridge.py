@@ -1,6 +1,6 @@
 """观测包装：把真实 AI Eyes 组件的调用与事件转换为测试台事件流。
 
-设计约束（见 Docs/测试台/执行方案.md §7）：
+设计约束（见 testbench/执行方案.md §7）：
 
 * ``ObservedBus.post`` 先投递原事件，再同步发出轻量副本；不消费原队列，不
   阻塞采集线程，不把音频 samples / 大图发到网页。
@@ -49,6 +49,7 @@ class _Turn:
     cancelled: bool = False
     closed: bool = False
     chat_used: bool = False
+    chat_final: bool = False
     first_text_ms: int | None = None
     tts_ms: float = 0.0
     played_pieces: set[str] = field(default_factory=set)
@@ -217,6 +218,9 @@ class Bridge:
                 played_ms=int(getattr(ev, "played_ms", 0) or 0),
                 total_ms=int(getattr(ev, "total_ms", 0) or 0),
                 cancelled=cancelled,
+                # 结束原因原样透传（completed / user_cancel / preempted / playback_stalled）。
+                # 旧事件没有该属性 → 空串 = 未标注，页面按"未知"处理，不默认成 user_cancel。
+                stop_reason=str(getattr(ev, "stop_reason", "") or ""),
             )
             if turn.assistant_text:
                 self._emit_event(
@@ -247,7 +251,8 @@ class Bridge:
             return
         with self._lock:
             turn = self._turns.get(turn_id)
-            if turn is None or turn.closed:
+            if turn is None or turn.closed or turn.chat_final:
+                # 已定稿（assistant.final 已发）后迟到的流片段：既不追加文字，也不再发 delta
                 return
             turn.assistant_text += text
             turn.first_text_ms = turn.first_text_ms or self._clock()
@@ -259,11 +264,15 @@ class Bridge:
             turn = self._turns.get(turn_id)
             if turn is None:
                 return
+            if turn.closed:
+                # 取消/关闭后迟到的定稿：保留已显示文字，不再覆盖也不重复发 final
+                return
             if text:
                 turn.assistant_text = text
             if turn.first_text_ms is None:
                 turn.first_text_ms = self._clock()
             turn.assistant_done = True
+            turn.chat_final = True
             if cancelled:
                 turn.cancelled = True
             turn.timings["generation_ms"] = max(0, int(generation_ms))
@@ -332,6 +341,10 @@ class Bridge:
         if not event:
             return
         ms = record.get("ms")
+        if category == "answer" and event == "spoken" and record.get("played") is True:
+            with self._lock:
+                if self._current is not None:
+                    self._close(self._current)
         bad = any(
             key in event
             for key in ("error", "failed", "timeout", "fault", "interrupted", "disconnect")
@@ -417,6 +430,21 @@ class _Delegate:
             setattr(object.__getattribute__(self, "_inner"), name, value)
 
 
+def _is_sink_playback_stopped(ev: Any) -> bool:
+    """是否为 sink 侧 ``PlaybackStopped``（``PlaybackFinished`` 的子类，带 ``stop_reason``）。
+
+    它表示"sink 侧看到这次播放结束了"，属于引擎内部信号：卡死/取消/播完时 sink 都会先发它，
+    engine 随后还会发自己的 ``PlaybackFinished``。派发时跳过它，页面才不会一次播放收到两条
+    ``state="finished"``；engine 那条带 ``stop_reason``，是唯一终态。
+    未装配 audio.output 时退化为类名判据。
+    """
+    try:
+        from aieyes.audio.output import PlaybackStopped  # noqa: PLC0415 - 目标机运行时依赖
+    except Exception:  # noqa: BLE001 - 未安装音频依赖时按类名兜底
+        return type(ev).__name__ == "PlaybackStopped"
+    return isinstance(ev, PlaybackStopped)
+
+
 class ObservedBus(_Delegate):
     def __init__(self, inner: Any, *, bridge: Bridge) -> None:
         super().__init__(inner)
@@ -449,7 +477,11 @@ class ObservedBus(_Delegate):
         elif isinstance(ev, evmod.PlaybackStarted):
             b.note_playback_started(ev)
         elif isinstance(ev, evmod.PlaybackFinished):
-            b.note_playback_finished(ev)
+            # 一次播放（卡死/取消/播完）会先收到 sink 的 PlaybackStopped、再收到 engine 的
+            # PlaybackFinished；两条都派发，页面就会收到两条 state="finished"（一条带 stop_reason、
+            # 一条空串）。只让 engine 那条成为唯一终态。
+            if not _is_sink_playback_stopped(ev):
+                b.note_playback_finished(ev)
         elif isinstance(ev, evmod.CancelRequested):
             b.note_cancel(getattr(ev, "reason", ""), ev.t_ms)
 

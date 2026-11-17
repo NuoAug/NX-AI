@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
+import numpy as np
+
 from speech_helpers import frames_from_wav, has_cjk
 
-from aieyes.interfaces import SAMPLE_RATE
+from aieyes.config import AsrConfig
+from aieyes.interfaces import SAMPLE_RATE, AudioFrame
+from aieyes.speech.asr import StreamingAsr
 
 
 def _question_wav(models):
@@ -38,6 +44,56 @@ def test_reset_and_empty_finalize(asr):
     assert utt.text == ""
     assert utt.t_audio_start_ms >= 0
     assert asr.has_utterance is False
+
+
+def test_silence_after_speech_is_not_fed_to_streaming_model():
+    engine = StreamingAsr(AsrConfig())
+    stream = Mock()
+    engine._stream = stream
+    engine._recognizer = Mock()
+    engine._recognizer.is_ready.return_value = False
+    engine._recognizer.get_result.return_value = ""
+    engine.accept(AudioFrame(np.full(320, 0.05, np.float32), 0))
+    engine.accept(AudioFrame(np.zeros(320, np.float32), 20))
+    assert stream.accept_waveform.call_count == 1
+
+
+def test_finalize_pads_tail_silence_after_speech():
+    """句后静音被跳过时，finalize 必须补零把最后一个 chunk 喂满，否则吞末字。"""
+    engine = StreamingAsr(AsrConfig())
+    stream = Mock()
+    engine._stream = stream
+    engine._recognizer = Mock()
+    engine._recognizer.is_ready.return_value = False
+    engine._recognizer.get_result.return_value = "这两个哪个贵"
+    engine._t_start_ms = 0
+    engine._t_end_ms = 1000
+    engine._speech_started = True
+
+    utt = engine.finalize()
+
+    assert utt.text == "这两个哪个贵"
+    stream.accept_waveform.assert_called_once()
+    rate, pad = stream.accept_waveform.call_args.args
+    assert rate == 16000
+    assert len(pad) == int(16000 * StreamingAsr._TAIL_PAD_MS / 1000)
+    stream.input_finished.assert_called_once()
+
+
+def test_finalize_without_speech_does_not_pad():
+    """纯噪声/空片段没有可收尾的语音，补零只会白跑一轮解码。"""
+    engine = StreamingAsr(AsrConfig())
+    stream = Mock()
+    engine._stream = stream
+    engine._recognizer = Mock()
+    engine._recognizer.is_ready.return_value = False
+    engine._recognizer.get_result.return_value = ""
+    engine._speech_started = False
+
+    engine.finalize()
+
+    stream.accept_waveform.assert_not_called()
+    stream.input_finished.assert_called_once()
 
 
 def test_accept_starts_utterance_implicitly(asr, models):

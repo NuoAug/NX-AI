@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from aieyes.scene import SceneConfig, SceneService
+from aieyes.scene.service import _find_target
 from scene_fakes import FakeOcr, FakeVlm, make_frame
 
 TARGET = "钥匙"
@@ -20,6 +21,12 @@ def _service(reply: str = "", *, error: Exception | None = None, config: SceneCo
 
 def _reply(items) -> str:
     return "```json\n" + json.dumps(items, ensure_ascii=False) + "\n```"
+
+
+def test_location_question_extracts_the_object_not_the_location_phrase():
+    assert _find_target("键盘现在在画面中的哪个地方") == "键盘"
+    assert _find_target("键盘在画面哪里") == "键盘"
+    assert _find_target("我的钥匙在屏幕上的哪个位置") == "钥匙"
 
 
 def test_three_candidates_are_limited_to_two_with_positions():

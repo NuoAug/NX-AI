@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 BENCH = HERE.parent
-SRC = BENCH.parent / "Src"
+SRC = BENCH.parent / "src"
 for path in (str(BENCH), str(SRC)):
     if path not in sys.path:
         sys.path.insert(0, path)
@@ -119,6 +119,19 @@ class BridgeTurnTests(unittest.TestCase):
         finals = self.rec.typed("assistant.final")
         self.assertTrue(any(item[2].get("cancelled") for item in finals))
 
+    def test_late_delta_after_final_is_dropped(self) -> None:
+        # 定稿后迟到的流片段：不得追加进已播文字，也不得在 assistant.final 之后补发 delta。
+        self.bridge.note_utterance("讲个故事", 100)
+        turn = self.bridge.chat_begin()
+        self.bridge.chat_delta(turn, "第一段")
+        self.bridge.chat_done(turn, "第一段", generation_ms=50)
+        before = len(self.rec.typed("assistant.delta"))
+        self.bridge.chat_delta(turn, "迟到片段")
+        self.assertEqual(len(self.rec.typed("assistant.delta")), before)
+        self.assertEqual(self.rec.typed("assistant.final")[-1][2]["text"], "第一段")
+        snapshot = [t for t in self.bridge.snapshot_turns() if t["turn_id"] == turn]
+        self.assertEqual(snapshot[0]["assistant"], "第一段")
+
     def test_tts_accumulates_and_sets_playback_wait(self) -> None:
         self.bridge.note_utterance("讲个故事", 100)
         self.bridge.chat_begin()
@@ -152,6 +165,21 @@ class BridgeTurnTests(unittest.TestCase):
         snap = self.bridge.snapshot_turns()
         self.assertTrue(snap)
         self.assertEqual(snap[0]["assistant"], "在的")
+
+    def test_late_chat_done_keeps_shown_cancelled_text(self) -> None:
+        self.bridge.note_utterance("讲个故事", 100)
+        turn = self.bridge.chat_begin()
+        self.bridge.chat_delta(turn, "从前有座山")
+        self.bridge.note_cancel("barge_in", 200)
+        self.bridge.chat_delta(turn, "山里有个庙")
+        self.bridge.chat_done(
+            turn, "从前有座山山里有个庙", generation_ms=80, cancelled=True
+        )
+        snap = self.bridge.snapshot_turns()[-1]
+        self.assertEqual(snap["assistant"], "从前有座山")
+        self.assertTrue(snap["cancelled"])
+        finals = [item[2] for item in self.rec.typed("assistant.final")]
+        self.assertEqual([item["text"] for item in finals], ["从前有座山"])
 
 
 class BridgeWrapperTests(unittest.TestCase):

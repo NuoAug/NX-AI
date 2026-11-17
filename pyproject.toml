@@ -1,6 +1,6 @@
 [project]
 name = "aieyes"
-version = "0.0.0"
+version = "0.0.1"
 description = "AI_Eyes 视觉语言交互子系统（interaction.v0.1）"
 requires-python = ">=3.10"
 dependencies = [

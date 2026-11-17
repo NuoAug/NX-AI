@@ -1,6 +1,6 @@
 """测试台 HTTP 服务：静态页面、状态/事件 API、按需管理工作进程。
 
-约束（见 ``Docs/测试台/执行方案.md`` §5/§6/§9）：
+约束（见 ``testbench/执行方案.md`` §5/§6/§9）：
 
 * 只监听 ``127.0.0.1``，同源访问；POST/DELETE 校验 Origin，缺失时要求内存令牌。
 * 真正的业务在 worker 子进程内执行；HTTP 线程不直接操作音频/相机/状态机。
@@ -69,7 +69,7 @@ _FRAME_ROUTE = re.compile(r"^/api/frames/([^/]+)$")
 # 基础工具
 # ---------------------------------------------------------------------------
 def load_bench() -> dict:
-    with open(BENCH_DIR / "Config" / "bench.json", "r", encoding="utf-8") as handle:
+    with open(BENCH_DIR / "config" / "bench.json", "r", encoding="utf-8") as handle:
         data = json.load(handle)
     if not isinstance(data, dict):
         raise ValueError("bench.json 顶层必须是对象")
@@ -204,7 +204,7 @@ class BenchServer:
     def _load_initial_capabilities(self) -> None:
         """只读 JSON，不初始化任何业务组件。"""
         try:
-            target = self.project_root / str(self.bench.get("target_config") or "Config/target.json")
+            target = self.project_root / str(self.bench.get("target_config") or "config/target.json")
             data = json.loads(target.read_text(encoding="utf-8"))
             contract = data.get("contract") or {}
             speaker = data.get("speaker") or {}
@@ -431,6 +431,9 @@ class BenchServer:
                 "alive": bool(self._worker is not None and self._worker.alive),
                 "pid": getattr(self._worker, "pid", None),
             }
+            data["services"]["worker"] = "alive" if data["worker"]["alive"] else "none"
+            if not data["worker"]["alive"]:
+                data["worker"]["pid"] = None
             data["token_required"] = False
             return data
 
@@ -496,11 +499,12 @@ class BenchServer:
     def stop_worker(self, reason: str = "recycle") -> None:
         with self.lock:
             worker = self._worker
-            if reason in ("idle_recycle", "debug_start_failed") and (self._run_active or self._debug_active or self._preview_active):
+            if reason in ("idle_recycle", "idle_watchdog", "debug_start_failed", "run_start_failed") and (self._run_active or self._debug_active or self._preview_active):
                 return
             if worker is None or not worker.alive:
                 return
             self._worker = None
+            self.state["services"]["worker"] = "none"
             self._worker_ready.clear()
         status = worker.stop(
             grace_ms=self.worker_stop_grace_ms,
@@ -604,12 +608,17 @@ class BenchServer:
         payload = event.get("payload")
         if not isinstance(payload, dict):
             payload = {}
-        run_id = str(event.get("run_id") or "") or None
+        source_run_id = str(event.get("run_id") or "")
         if self._event_kind == "debug":
-            run_id = self._debug_run_id
             for key in ("image_id", "image_a", "image_b"):
                 if key in payload:
                     payload.pop(key, None)
+        if source_run_id:
+            current_run_id = self._event_run_id
+            # 上一轮会话的残留线程（旧音频帧/识别分段/回答增量）仍在飞时，事件不得写入新一轮；
+            # 收尾后 `_event_run_id` 为 None（空闲窗口）同样不是"当前轮"，也必须丢弃。
+            if not current_run_id or source_run_id != str(current_run_id):
+                return
         self.append_event(etype, payload, turn_id=event.get("turn_id"))
 
     def _handle_state_patch(self, patch: dict) -> None:
@@ -621,6 +630,21 @@ class BenchServer:
                 if key not in patch:
                     continue
                 value = patch[key]
+                if key == "run":
+                    # 本轮已结束或属于上一轮的迟到补丁不得改写当前状态（清单 24/43）。
+                    if not self._run_active:
+                        continue
+                    if isinstance(value, dict) and value.get("id") and str(value["id"]) != str(self._run_id):
+                        continue
+                if key == "debug":
+                    if not self._debug_active:
+                        continue
+                    if (
+                        isinstance(value, dict)
+                        and value.get("run_id")
+                        and str(value["run_id"]) != str(self._debug_run_id)
+                    ):
+                        continue
                 if isinstance(value, dict):
                     current = self.state.get(key)
                     if isinstance(current, dict):
@@ -629,14 +653,14 @@ class BenchServer:
                         self.state[key] = merged
                     else:
                         self.state[key] = dict(value)
+                    if key == "run":
+                        run_status = value.get("status")
+                        if value.get("id"):
+                            self.state.setdefault("run", {})
+                    if key == "debug":
+                        self.state.setdefault("debug", {})
                 else:
                     self.state[key] = value
-            if isinstance(patch.get("run"), dict):
-                run_status = patch["run"].get("status")
-                if patch["run"].get("id"):
-                    self.state.setdefault("run", {})
-            if isinstance(patch.get("debug"), dict):
-                self.state.setdefault("debug", {})
         self._sync_services()
         if run_status in ("completed", "failed", "interrupted"):
             self._finalize_run(str(run_status))
@@ -745,11 +769,16 @@ class BenchServer:
         self._event_kind = None
 
     def _on_run_start_done(self, run_id: str, result: dict | None, error: dict | None) -> None:
-        if self._run_id != run_id:
-            return
+        with self.lock:
+            if self._run_id != run_id or not self._run_active:
+                return
         if error:
             message = str(error.get("message") or "启动失败")
             with self.lock:
+                # 复查放在与写入相同的锁内：两次加锁之间该轮可能已按取消收尾，
+                # 迟到错误不得把 interrupted 覆盖成 failed（清单 43）。
+                if self._run_id != run_id or not self._run_active:
+                    return
                 self._run_active = False
                 run = dict(self.state.get("run") or {})
                 run.update(
@@ -808,7 +837,7 @@ class BenchServer:
         self._watch_worker_exit()
 
     def _watch_worker_exit(self) -> None:
-        """worker 正常会自行退出；若 5s 后仍滞留则回收，避免留下孤儿进程。"""
+        """回收运行结束后仍空闲的 worker；新运行中的 worker 保留。"""
 
         def _check() -> None:
             time.sleep(5.0)
@@ -884,11 +913,12 @@ class BenchServer:
         return {"run_id": debug_id, "module": module, "status": "starting"}
 
     def _on_debug_start_done(self, debug_id: str, result: dict | None, error: dict | None) -> None:
-        if self._debug_run_id != debug_id:
-            return
         if error:
             message = str(error.get("message") or "调试启动失败")
             with self.lock:
+                # 与运行入口同一条规则：该次调试已结束（例如取消）时丢弃迟到错误。
+                if self._debug_run_id != debug_id or not self._debug_active:
+                    return
                 self._debug_active = False
                 debug = dict(self.state.get("debug") or {})
                 debug.update({"status": "failed", "ended_at": wall_iso(), "error": message})
@@ -951,6 +981,7 @@ class BenchServer:
             self._release_active_uploads()
             self.state["services"]["interaction"] = "idle"
         self.write_log("INFO", "debug", f"debug finished: {status}")
+        self._watch_worker_exit()
 
     def _freeze_images(self) -> dict:
         """冻结当前 A/B 上传图（若存在），标记为被活动任务引用。"""

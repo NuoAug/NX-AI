@@ -28,6 +28,11 @@ def pick_model_file(model_dir: Path, stem: str) -> Path:
 class StreamingAsr:
     """流式 paraformer 识别器（采集线程内同步调用）。"""
 
+    #: finalize 前补的尾部静音。流式 Paraformer 需要右侧上下文才能吐出最后一两个字；
+    #: 句后长静音被 ``silence_skip_rms`` 跳过（防句中断顿重复），收尾就必须显式补零。
+    #: 实测 300ms 起有效，500ms 还能救回句末语气词；再长没有新增收益。
+    _TAIL_PAD_MS = 500
+
     def __init__(
         self,
         cfg: AsrConfig | None = None,
@@ -47,6 +52,7 @@ class StreamingAsr:
         self._t_start_ms: int | None = None
         self._t_end_ms: int | None = None
         self._last_partial = ""
+        self._speech_started = False
 
     # ------------------------------------------------------------------
     @property
@@ -96,6 +102,7 @@ class StreamingAsr:
         self._t_start_ms = None
         self._t_end_ms = None
         self._last_partial = ""
+        self._speech_started = False
 
     def accept(self, frame: AudioFrame) -> str | None:
         """喂一帧；有新的部分结果时返回文本，否则 ``None``。"""
@@ -104,8 +111,18 @@ class StreamingAsr:
         stream = self._stream
         if self._t_start_ms is None:
             self._t_start_ms = int(frame.t_start_ms)
+        samples = np.asarray(frame.samples, dtype=np.float32)
+        # 长静音段不喂流式模型：实测句中断顿会让 Paraformer 重复或吞掉尾字。
+        # 开口前的前置静音仍保留，给模型建立上下文。
+        if samples.size:
+            rms = float(np.sqrt(np.mean(np.square(samples))))
+            if rms >= 0.01:
+                self._speech_started = True
+            elif self._speech_started and rms < float(self.cfg.silence_skip_rms):
+                self._t_end_ms = int(frame.t_start_ms) + int(frame.duration_ms)
+                return None
         sr = float(self.cfg.sample_rate)
-        stream.accept_waveform(sr, np.asarray(frame.samples, dtype=np.float32))
+        stream.accept_waveform(sr, samples)
         while self._recognizer.is_ready(stream):
             self._recognizer.decode_stream(stream)
         self._t_end_ms = int(frame.t_start_ms) + int(frame.duration_ms)
@@ -115,12 +132,30 @@ class StreamingAsr:
             return text
         return None
 
+    def result(self) -> str:
+        """当前流结果（不结束、不重置）；供前端判断句末是否还需要等短停顿。
+
+        直接返回 ``accept()`` 已解码出的最后一段文本，避免在端点处再调用一次
+        ``get_result`` 改变解码器状态或引入额外耗时。
+        """
+        return self._last_partial
+
     def finalize(self) -> Utterance:
         """结束当前片段，返回最终文本与时间戳（无音频时返回空文本）。"""
         now = mono_ms()
         stream = self._stream
         text = ""
         if stream is not None:
+            if self._speech_started:
+                # 句后静音帧在 accept() 里被跳过，收尾补零把最后一个 chunk 喂满。
+                pad = np.zeros(
+                    int(float(self.cfg.sample_rate) * self._TAIL_PAD_MS / 1000),
+                    dtype=np.float32,
+                )
+                try:
+                    stream.accept_waveform(float(self.cfg.sample_rate), pad)
+                except Exception:
+                    pass
             try:
                 stream.input_finished()
             except Exception:
@@ -144,6 +179,7 @@ class StreamingAsr:
         self._t_start_ms = None
         self._t_end_ms = None
         self._last_partial = ""
+        self._speech_started = False
 
     def close(self) -> None:
         self.reset()

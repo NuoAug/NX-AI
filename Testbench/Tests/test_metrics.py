@@ -1,4 +1,4 @@
-"""Unit tests for Testbench/metrics.py.
+"""Unit tests for testbench/metrics.py.
 
 Standard-library ``unittest`` only.  Fake procfs / sysfs trees are built in
 temporary directories so nothing outside the test directory is read for the
@@ -6,7 +6,7 @@ process metrics.
 
 Run from the repository root (no bytecode written)::
 
-    python -B -m unittest discover -s Testbench/Tests -p "test_metrics.py" -v
+    python -B -m unittest discover -s testbench/tests -p "test_metrics.py" -v
 """
 
 import os
@@ -166,8 +166,36 @@ class SnapshotTests(MetricsTestCase):
                 "worker_cpu_percent",
                 "model_cpu_percent",
                 "bench_cpu_percent",
+                "memory",
             },
         )
+        # 口径分层必须是快照的固定成员（标签只增不改）。
+        memory = snapshot["detail"]["memory"]
+        self.assertEqual(
+            set(memory),
+            {
+                "method",
+                "accounting",
+                "complete",
+                "roots",
+                "process_count",
+                "processes",
+                "sampling_gaps",
+                "notes",
+                "components",
+                "conservative_upper_bound",
+                "dedup_estimate",
+                "undeterminable",
+                "verdict",
+                "sampling_window_ms",
+            },
+        )
+        for label in (
+            "conservative_upper_bound",
+            "dedup_estimate",
+            "undeterminable",
+        ):
+            self.assertEqual(memory[label]["label"], label)
         self.assertEqual(snapshot["sampled_at"], int(1_700_000_000.0 * 1000))
         for key in (
             "worker_rss_bytes",

@@ -17,12 +17,19 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BENCH = HERE.parent
-SRC = BENCH.parent / "Src"
+SRC = BENCH.parent / "src"
 for path in (str(BENCH), str(SRC)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
 import server as server_mod  # noqa: E402
+import devices as devices_mod  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+DEVICE_CHOICES = {
+    key: [{"id": "", "label": "系统默认（外接设备）", "occupancy": "待核实"}]
+    for key in ("camera", "microphone", "speaker")
+}
 
 
 class FakeWorker:
@@ -84,7 +91,7 @@ class ServerTestBase(unittest.TestCase):
             "host": "127.0.0.1",
             "port": 0,
             "project_root": str(BENCH.parent),
-            "target_config": "Config/target.json",
+            "target_config": "config/target.json",
             "python": "../.venv/bin/python",
             "static_files": ["index.html", "app.js"],
             "event_buffer_size": 4,
@@ -255,10 +262,68 @@ class HttpTests(ServerTestBase):
         self.assertIn(b"<!doctype html", data.lower())
         status, _, _ = self.request("GET", "/%2e%2e/%e6%89%a7%e8%a1%8c%e6%96%b9%e6%a1%88.md")
         self.assertEqual(status, 404)
-        status, _, _ = self.request("GET", "/Src/aieyes/app.py")
+        status, _, _ = self.request("GET", "/src/aieyes/app.py")
         self.assertEqual(status, 404)
         status, _, _ = self.request("GET", "/api/preview.jpg")
         self.assertEqual(status, 503)
+
+    def test_memory_and_device_wording_is_honest(self) -> None:
+        self.serve()
+        status, data, _ = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        html = data.decode("utf-8")
+        # 3 进程 RSS 合计只是参考值：标签必须带“参考”，且不能用像素条暗示预算达标。
+        self.assertIn("三进程 RSS 合计（参考）", html)
+        self.assertIn("不是预算占用率", html)
+        self.assertIn("测试台自身 RSS", html)
+        self.assertNotIn("测试台自身内存", html)
+        # 设备列表还没读到时不能先显示成“系统默认”。
+        self.assertNotIn('<option value="">系统默认</option>', html)
+        self.assertEqual(html.count("设备列表未读取"), 3)
+
+    def test_second_page_and_active_run_cannot_switch_devices(self) -> None:
+        self.serve()
+        origin = {
+            "Origin": f"http://127.0.0.1:{self.ctx.port}",
+            "Content-Type": "application/json",
+        }
+        self.heartbeat("page-1")
+        status, _, _ = self.request(
+            "POST", "/api/client/claim",
+            body=json.dumps({"request_id": "req-dual"}).encode(),
+            headers=dict(origin, **{"X-Bench-Client": "page-1"}),
+        )
+        self.assertEqual(status, 200)
+        self.heartbeat("page-2")
+        payload = json.dumps({"camera": "", "microphone": "", "speaker": ""}).encode()
+        # 第二个页面只读：改设备必须被挡在控制权这一层。
+        status, data, _ = self.request(
+            "POST", "/api/devices", body=payload,
+            headers=dict(origin, **{"X-Bench-Client": "page-2"}),
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(data)["error"]["code"], "client_readonly")
+        with patch.object(devices_mod, "inventory", return_value=(DEVICE_CHOICES, [])), \
+                patch.object(devices_mod, "save", return_value={"camera": "", "microphone": "", "speaker": ""}) as save:
+            # 活动运行中（含预览/调试/worker 存活）即使 owner 也不能切换设备。
+            self.ctx._run_active = True
+            try:
+                status, data, _ = self.request(
+                    "POST", "/api/devices", body=payload,
+                    headers=dict(origin, **{"X-Bench-Client": "page-1"}),
+                )
+            finally:
+                self.ctx._run_active = False
+            self.assertEqual(status, 409)
+            self.assertEqual(json.loads(data)["error"]["code"], "device_busy")
+            save.assert_not_called()
+            # 停止后同一个 owner 可以正常切换，说明封锁只针对活动运行。
+            status, data, _ = self.request(
+                "POST", "/api/devices", body=payload,
+                headers=dict(origin, **{"X-Bench-Client": "page-1"}),
+            )
+            self.assertEqual(status, 200, data)
+            self.assertEqual(save.call_count, 1)
 
     def test_cross_site_control_rejected(self) -> None:
         self.serve()

@@ -51,6 +51,9 @@ CONFIG = ROOT / "Config" / "target.json"
 class UnusedChat:
     """价格比较不应提交聊天模型；若被调用说明意图路由错了。"""
 
+    def complete(self, *args, **kwargs):  # pragma: no cover - 失败路径
+        raise AssertionError(f"比较意图不应提交聊天模型: {args!r}")
+
     def ask(self, text: str):  # pragma: no cover - 失败路径
         raise AssertionError(f"比较意图不应提交聊天模型: {text}")
 
@@ -163,25 +166,37 @@ def _dump(records: list[dict]) -> str:
 
 
 def test_compare_two_price_labels(config: AppConfig, tmp_path: Path) -> None:
-    """“这两个哪个贵？” → A/B 各取一张 → OCR 比较价格 → 播报差异。"""
+    """“这两个哪个贵？” → 提示放第一件 → 确认后拍 A → 确认后拍 B → 比较播报。"""
     _require_server(config)
     question = _question_fixture("compare_two_which_expensive")
+    # 新流程不会一听到比较就抢拍：先等用户把第一件放好并确认。
+    # 同一段“继续比较这两样东西的价格”在 waiting_first / waiting_second 都会恢复拍摄。
+    confirm = _question_fixture("resume_compare")
 
     provider = FileFrameProvider(_compare_images())
     evidence = tmp_path / "compare.jsonl"
     try:
         ok, records, sink = _run_compare_scenario(
             config,
-            [_wake_path(), _silence(2500), question, _silence(2500)],
+            [
+                _wake_path(),
+                _silence(2500),
+                question,
+                _silence(2500),
+                confirm,
+                _silence(2500),
+                confirm,
+                _silence(2500),
+            ],
             provider,
             evidence,
             wait=lambda recs: bool(_find(recs, "answer", "spoken")),
-            timeout_s=60.0,
+            timeout_s=90.0,
         )
     finally:
         provider.close()
 
-    assert ok, f"60s 内没有完成双图比较，证据:\n{_dump(records)}"
+    assert ok, f"90s 内没有完成双图比较，证据:\n{_dump(records)}"
     compare_answer = _find(records, "compare", "answer")
     assert compare_answer, f"缺少比较回答记录: {_dump(records)}"
     rec = compare_answer[-1]

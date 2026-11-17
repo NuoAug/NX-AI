@@ -21,8 +21,12 @@ from .logging_setup import JsonlEvidenceLogger, setup_logging
 log = logging.getLogger("aieyes.app")
 
 
-def _make_source(cfg: AppConfig) -> Any:
-    """按配置创建音频输入源（回放 / 真实声卡）。"""
+def _make_source(cfg: AppConfig, *, bus: EventBus | None = None) -> Any:
+    """按配置创建音频输入源（回放 / 真实声卡）。
+
+    ``bus`` 只给真实声卡：采集源据此上报 ``DeviceFault(device="audio_in")``，
+    由 engine T14 决定恢复。不传时保持 ``SoundDeviceSource`` 的默认关闭语义。
+    """
     if cfg.audio.backend == "replay":
         from .audio.replay_source import ReplaySource, build_replay_playlist
 
@@ -39,7 +43,7 @@ def _make_source(cfg: AppConfig) -> Any:
         )
     from .audio.capture import SoundDeviceSource
 
-    return SoundDeviceSource(cfg.audio, device=cfg.audio.input_device)
+    return SoundDeviceSource(cfg.audio, device=cfg.audio.input_device, bus=bus)
 
 
 def _make_identity(cfg: AppConfig) -> Any | None:
@@ -109,6 +113,9 @@ def build_engine(
         from .speech.tts import PiperTts
 
         tts = PiperTts(cfg.tts)
+        info = getattr(tts, "fixed_cache_info", None)
+        if callable(info):
+            log.info("固定提醒缓存: %s", info())
     if sink is None:
         from .audio.output import AudioSink
 
@@ -120,7 +127,7 @@ def build_engine(
         from .speech.kws import SherpaKws
 
         frontend = SpeechFrontend(
-            _make_source(cfg),
+            _make_source(cfg, bus=bus),
             kws=SherpaKws(cfg.kws),
             vad=EnergyVad(cfg.vad),
             asr=StreamingAsr(cfg.asr),

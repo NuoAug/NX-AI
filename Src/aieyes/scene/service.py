@@ -20,6 +20,7 @@ from __future__ import annotations
 import colorsys
 import datetime as _dt
 import json
+import logging
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -27,9 +28,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
+
 from aieyes.clock import mono_ms
 from aieyes.errors import AieyesError
 from aieyes.interfaces import ImageFrame, OcrLine, OcrResult
+from aieyes.vision.image_ops import resize_to
 from aieyes.vision.quality import QualityReport, check_quality
 
 from .errors import (
@@ -54,8 +58,10 @@ from .parse import (
     format_amount_cn,
     format_date_cn,
 )
-from .prompts import describe_prompt, find_object_prompt, read_text_prompt
+from .prompts import compare_prompt, describe_prompt, find_object_prompt, read_text_prompt
 from .providers import CameraFrameProvider, FramePolicy, FrameProvider
+
+log = logging.getLogger(__name__)
 
 #: 意图 → 取图用途（与合同 frame.acquire.purpose 对齐）
 PURPOSE_BY_INTENT: dict[str, str] = {
@@ -271,6 +277,10 @@ class SceneService:
         self._owns_ocr = ocr is None
         self._owns_provider = provider is None
         self._ocr_cache: OrderedDict[str, OcrResult] = OrderedDict()
+        #: 最近一次 `answer()` 实际使用过的帧：上层做同图追问/翻面复用时取它
+        #: （功能说明 L171「复用已有照片」）。取消或新一轮开始时由上层调
+        #: :meth:`reset_last_frame` 清掉，避免把上一轮的旧图当成当前画面。
+        self.last_frame: ImageFrame | None = None
 
     # ------------------------------------------------------------------
     # 依赖的惰性默认实现（避免 import 即加载模型/网络库）
@@ -303,6 +313,10 @@ class SceneService:
                 )
             )
         return self._provider
+
+    def reset_last_frame(self) -> None:
+        """丢掉缓存帧：取消、停止、新一轮开始时调用，防止跨轮复用旧图。"""
+        self.last_frame = None
 
     def close(self) -> None:
         """释放自建的模型/取图资源；注入的对象由调用方管理。"""
@@ -417,6 +431,8 @@ class SceneService:
             timings["quality"] = mono_ms() - t0
         if _gated(quality) and "low_quality" not in degraded:
             degraded.append("low_quality")
+        # 记下本轮真正用过的帧：同图追问/翻面复用时上层拿它复用，不再重新取图。
+        self.last_frame = frame
 
         # 3) OCR-first（找物走 VLM；其它意图都先拿原文）
         ocr_result: OcrResult | None = None
@@ -555,7 +571,39 @@ class SceneService:
                 timings={"total": max(0, mono_ms() - started)},
             )
 
-        wanted = _compare_items(question)
+        if frame_a.frame_id and frame_a.frame_id == frame_b.frame_id:
+            # 清单 21：两个位置是同一张图时不能输出“比较结果”，否则等于旧图冒充成功。
+            return CompareAnswer(
+                text="这两个位置是同一张图，没法比较。把要比较的两样东西分别放到两个位置，各拍一张再来问。",
+                a_frame_id=frame_a.frame_id,
+                b_frame_id=frame_b.frame_id,
+                degraded=("same_frame",),
+                timings={"total": max(0, mono_ms() - started)},
+            )
+
+        explicit_fields = _compare_fields(question)
+        dropped_fields = _compare_dropped_fields(question)
+        wanted = explicit_fields or tuple(
+            name for name in ("price", "date", "color") if name not in dropped_fields
+        )
+        if not wanted:
+            # 三项都被明确排除：问清要比哪一项，不擅自猜一个维度。
+            return CompareAnswer(
+                text="价格、日期、颜色都不比的话，你想让我比哪一项？",
+                degraded=("no_compare_field",),
+                a_frame_id=frame_a.frame_id,
+                b_frame_id=frame_b.frame_id,
+                timings={"total": max(0, mono_ms() - started)},
+            )
+        # 用户只说“对比物品”时，结构化字段往往读不全；允许 VLM 补一段
+        # “各是什么、最明显的区别”，避免只回一句“价格/日期/颜色都没读全”。
+        # 容量/大小/重量等没有结构化口径的维度也交给 VLM，不能因为旧问题里
+        # 带了“价格”就把它静默忽略。
+        generic_dim = bool(_GENERIC_DIM_RE.search(question or ""))
+        generic_question = (
+            (not explicit_fields and not dropped_fields)
+            or generic_dim
+        )
         need_ocr = any(name in ("price", "date") for name in wanted)
 
         t0 = mono_ms()
@@ -580,7 +628,31 @@ class SceneService:
             else:
                 missing.append(item.name)
 
-        if conclusions:
+        vlm_text = ""
+        # 价格/日期已经是可靠结论时，结构化回答本身有信息量，不再加一轮 VLM
+        # （否则准确数字会被长描述埋在后面，还多付几秒）。只有只剩颜色或什么都没
+        # 读到时，才用并排图补“各是什么、最明显的差异”。
+        strong_conclusion = any(label in ("价格", "日期") for label in common)
+        if generic_question and (generic_dim or (missing and not strong_conclusion)):
+            t_vlm = mono_ms()
+            try:
+                vlm_text = self._compare_with_vlm(question, frame_a, frame_b)
+            except SceneAnalysisError as exc:
+                degraded.append("vlm_compare_failed")
+                vlm_text = ""
+                log.debug("VLM 比较兜底失败: %s", exc)
+            timings["vlm_compare"] = mono_ms() - t_vlm
+            if not _useful_compare_text(vlm_text):
+                if vlm_text:
+                    degraded.append("vlm_compare_unclear")
+                vlm_text = ""
+
+        if vlm_text:
+            # 已有可靠结构化结论（如价格）时保留它，再补 VLM 的可见差异描述，
+            # 不能让补充维度把准确数字冲掉。
+            prefix = ("比较结果：" + "；".join(conclusions) + "。") if conclusions else ""
+            text = prefix + vlm_text.rstrip("。！？!?；;，, ") + "。"
+        elif conclusions:
             text = "比较结果：" + "；".join(conclusions) + "。"
             if missing:
                 text += "（" + "、".join(missing) + "没读到，这次没比。"
@@ -592,6 +664,16 @@ class SceneService:
                 + "都没读全。"
             )
         timings["total"] = max(0, mono_ms() - started)
+        vlm_tags_a = (
+            (SourceTag(kind="vlm", frame_id=frame_a.frame_id, raw_text=vlm_text),)
+            if vlm_text
+            else ()
+        )
+        vlm_tags_b = (
+            (SourceTag(kind="vlm", frame_id=frame_b.frame_id, raw_text=vlm_text),)
+            if vlm_text
+            else ()
+        )
         return CompareAnswer(
             text=text,
             items=tuple(items),
@@ -599,8 +681,8 @@ class SceneService:
             missing=tuple(missing),
             a_frame_id=frame_a.frame_id,
             b_frame_id=frame_b.frame_id,
-            a_tags=tuple(view_a.tags),
-            b_tags=tuple(view_b.tags),
+            a_tags=vlm_tags_a or tuple(view_a.tags),
+            b_tags=vlm_tags_b or tuple(view_b.tags),
             degraded=tuple(dict.fromkeys(degraded)),
             timings=timings,
         )
@@ -938,6 +1020,27 @@ class SceneService:
                 f"画面识别失败：{exc}", cause=str(exc), provider="vlm"
             ) from exc
 
+    def _compare_with_vlm(
+        self, question: str, frame_a: ImageFrame, frame_b: ImageFrame
+    ) -> str:
+        """两图并排成一张，交给单图 VLM 说清“各是什么、最明显的区别”。
+
+        不依赖服务端多图能力，避免不同 llama.cpp/视觉投影实现对多图的差异。
+        """
+        try:
+            composite = _side_by_side(frame_a.rgb, frame_b.rgb)
+            return self.vlm.complete(
+                compare_prompt(question),
+                images=(composite,),
+                max_tokens=min(int(self.config.vlm_max_tokens), 160),
+                timeout_s=self.config.vlm_timeout_s,
+                temperature=0.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SceneAnalysisError(
+                f"画面比较失败：{exc}", cause=str(exc), provider="vlm"
+            ) from exc
+
     # ------------------------------------------------------------------
     # compare 内部
     # ------------------------------------------------------------------
@@ -1197,6 +1300,10 @@ def _find_target(question: str) -> str:
     """从找物问题里提取目标名词；提取不到就用去掉疑问词后的问题。"""
     text = (question or "").strip()
     patterns = (
+        # “键盘现在在画面中的哪个地方”：先取“在画面…”之前的物体名
+        r"^(.{1,20}?)\s*(?:现在|刚才|目前)?\s*(?:在|位于)\s*"
+        r"(?:画面|图里|图中|屏幕|照片|视野|眼前|前面)"
+        r"(?:里|中|上)?(?:的)?(?:哪里|哪儿|哪个地方|哪个位置|什么位置|何处)",
         r"(?:帮我找|找一下|找一找|寻找|找)\s*([^\s，。？！?！,]{1,20})",
         r"([^\s，。？！?！,]{1,20})\s*(?:在|放|摆)\s*(?:哪|哪里|哪儿)",
         r"(?:有没有|看见|看到)\s*(?:我的)?\s*([^\s，。？！?！,]{1,20})",
@@ -1206,6 +1313,7 @@ def _find_target(question: str) -> str:
         if match is not None:
             target = match.group(1).strip()
             target = re.sub(r"^(?:我的|那个|这个|一只|一个|我的那个)", "", target)
+            target = re.sub(r"(?:现在|刚才|目前)$", "", target)
             target = re.sub(r"(?:在哪儿|在哪里|在哪|呢|吗|呀|啊)$", "", target)
             if target:
                 return target[:20]
@@ -1254,8 +1362,42 @@ def _dominant_color(rgb) -> str:
     return name
 
 
-def _compare_items(question: str) -> tuple[str, ...]:
+def _side_by_side(
+    left: np.ndarray, right: np.ndarray, *, height: int = 480, gap: int = 12
+) -> np.ndarray:
+    """把两张图等比缩到同高、中间加白线并排，供单图 VLM 比较。"""
+
+    def _fit(image: np.ndarray) -> np.ndarray:
+        arr = np.asarray(image)
+        if arr.ndim != 3 or arr.shape[0] <= 0 or arr.shape[1] <= 0:
+            raise ValueError("invalid frame for compare")
+        h, w = arr.shape[:2]
+        width = max(1, int(round(w * float(height) / float(h))))
+        return resize_to(arr, width, int(height))
+
+    canvas_a = _fit(left)
+    canvas_b = _fit(right)
+    divider = np.full((int(height), max(0, int(gap)), 3), 255, dtype=np.uint8)
+    parts = (canvas_a, divider, canvas_b) if divider.shape[1] else (canvas_a, canvas_b)
+    return np.concatenate(parts, axis=1)
+
+
+#: 没有结构化口径、只能交给 VLM 描述的可见维度。
+_GENERIC_DIM_RE = re.compile(r"容量|大小|重量|尺寸|规格|形状|包装|材质|成分|口感")
+
+
+def _compare_fields(question: str) -> tuple[str, ...]:
+    """用户明确点到的比较项；空表示“只说了对比，没有指定维度”。
+
+    “不比价格/不看颜色”是明确删掉某一项：先剔掉这些片段，再提取剩余维度。
+    """
     text = (question or "").strip()
+    text = re.sub(
+        r"(?:不比|不看|别比|不要比|不用比|不算|去掉|删掉|不比较)(?:价格|日期|颜色)",
+        " ",
+        text,
+    )
+    text = re.sub(r"(?:价格|日期|颜色)(?:不比|不算|不看|去掉|删掉)", " ", text)
     wanted: list[str] = []
     if re.search(r"价格|贵|便宜|钱", text):
         wanted.append("price")
@@ -1263,9 +1405,38 @@ def _compare_items(question: str) -> tuple[str, ...]:
         wanted.append("date")
     if re.search(r"颜色|什么色|色", text):
         wanted.append("color")
-    if not wanted:
-        wanted = ["price", "date", "color"]
     return tuple(wanted)
+
+
+def _compare_dropped_fields(question: str) -> tuple[str, ...]:
+    """用户明确说“不比/不看/去掉”的维度；用于从默认三项里排除。"""
+    text = question or ""
+    dropped: list[str] = []
+    for name, pattern in (
+        ("price", r"价格|价钱|多少钱"),
+        ("date", r"日期|保质期|到期"),
+        ("color", r"颜色"),
+    ):
+        neg = rf"(?:不比|不看|别比|不要比|不用比|不算|去掉|删掉|不比较)(?:{pattern})"
+        post = rf"(?:{pattern})(?:不比|不算|不看|去掉|删掉)"
+        if re.search(neg, text) or re.search(post, text):
+            dropped.append(name)
+    return tuple(dropped)
+
+
+
+def _compare_items(question: str) -> tuple[str, ...]:
+    wanted = _compare_fields(question)
+    return wanted or ("price", "date", "color")
+
+
+def _useful_compare_text(text: str) -> bool:
+    """VLM 兜底是否给出了可用描述；整句拒绝/空话不算。"""
+    content = (text or "").strip()
+    if len(content) < 12:
+        return False
+    core = content.strip("。！？!?；;，, ")
+    return core not in ("看不清", "无法比较", "没法比较", "看不到", "不知道")
 
 
 def _compare_item(name: str, view_a: _FrameView, view_b: _FrameView) -> CompareItem:

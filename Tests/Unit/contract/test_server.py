@@ -167,8 +167,16 @@ def test_slow_handler_times_out_client_but_connection_survives():
                 handlers.capabilities_result_data(capabilities={"frame_provider": True}),
             )
             fake.delay("capabilities.get", 0.4)
-            with pytest.raises(transport.RequestTimeout):
-                await rig.client.capabilities_get(timeout_ms=100)
+            # 服务端的 deadline 看门狗与客户端的 wait_for 都按同一个 100ms 计时：
+            # 回包可能先到（DEADLINE_EXCEEDED），也可能本地先超时。两种都合法，
+            # 本用例要保证的是——请求不会拿到成功结果，且连接在超时后仍可用。
+            try:
+                reply = await rig.client.capabilities_get(timeout_ms=100)
+            except transport.RequestTimeout:
+                pass
+            else:
+                assert reply.status == "unavailable", reply
+                assert reply.error_code() == "DEADLINE_EXCEEDED", reply
 
             fake.delay("capabilities.get", 0)
             response = await rig.client.capabilities_get(timeout_ms=2500)

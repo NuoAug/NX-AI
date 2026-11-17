@@ -85,7 +85,14 @@ class ChatSession:
         images: Sequence[np.ndarray] = (),
         timeout_s: float | None = None,
         temperature: float | None = None,
+        record: bool = True,
     ) -> Answer:
+        """生成一轮回答。
+
+        ``record=False`` 供调用方自行按期次提交历史：超时被放弃的生成线程仍会
+        跑完并返回，此时不能替用户留下一条从未播出的问答（见引擎 ``_do_chat``）。
+        默认 ``True`` 保持 ``Testbench/debug.py`` 等直调用法的历史行为。
+        """
         prompt = self.build_prompt(user_text)
         t0 = mono_ms()
         text = self.vlm.complete(
@@ -97,7 +104,8 @@ class ChatSession:
         )
         t1 = mono_ms()
         text = (text or "").strip()
-        self.record(user_text, text, images=len(images), t_ms=t1)
+        if record:
+            self.record(user_text, text, images=len(images), t_ms=t1)
         return Answer(
             text=text,
             t_start_ms=t0,

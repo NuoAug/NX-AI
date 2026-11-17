@@ -48,8 +48,30 @@ from test_replay_voice_chain import (  # noqa: E402
 pytestmark = [pytest.mark.target, pytest.mark.slow]
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = ROOT / "Tests" / "Fixtures" / "audio"
-CONFIG = ROOT / "Config" / "target.json"
+
+
+def _resolve(*parts: str) -> Path:
+    """兼容本机 Tools/Tests/Config 与目标板 tools/tests/config 的大小写。"""
+    current = ROOT
+    for part in parts:
+        candidate = current / part
+        if candidate.exists():
+            current = candidate
+            continue
+        matches = (
+            [p for p in current.iterdir() if p.name.lower() == part.lower()]
+            if current.is_dir()
+            else []
+        )
+        if matches:
+            current = matches[0]
+            continue
+        return candidate
+    return current
+
+
+FIXTURES = _resolve("Tests", "Fixtures", "audio")
+CONFIG = _resolve("Config", "target.json")
 
 SYSTEM_PROMPT = "你是戴在用户眼前的智能眼镜助手，用中文简短口语化回答，一般不超过两句话。"
 
@@ -111,7 +133,18 @@ class CountingVlm:
 def _require_server(cfg: AppConfig) -> VlmClient:
     client = VlmClient(cfg.llm, cfg.vlm)
     if not client.health():
+        client.close()
         pytest.skip(f"llama-server 未就绪（{cfg.llm.base_url}），先运行 Tools/serve_llama.sh")
+    # 验收口径是“普通热态聊天”：先跑一次极短生成，把模型/视觉投影加载
+    # 与首帧分配放到计时之外；否则冷启动会被算进被测首声，导致样本抖动。
+    try:
+        client.complete(
+            "你好",
+            max_tokens=1,
+            timeout_s=max(10.0, float(cfg.llm.request_timeout_s)),
+        )
+    except Exception:
+        pass
     return client
 
 
@@ -266,7 +299,9 @@ def test_same_sentence_wake_and_question(cfg: AppConfig, tmp_path: Path) -> None
     vlm = CountingVlm(client)
     # 用固定夹具而不是运行时合成：Piper 的随机时长会让同一句话每次声学不同，
     # 两字唤醒词在部分合成结果上会漏检（阶段 1 报告已列为风险）。
-    wav_path = Path(__file__).resolve().parents[1] / "Fixtures" / "audio" / "wake" / "same_sentence.wav"
+    wav_path = _resolve(
+        "Tests", "Fixtures", "audio", "wake", "same_sentence.wav"
+    )
 
     segments = [wav_path, _silence(1800)]
     evidence = tmp_path / "same_sentence.jsonl"

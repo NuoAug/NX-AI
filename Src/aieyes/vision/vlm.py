@@ -192,6 +192,11 @@ class VlmClient:
                 timeout=http_timeout,
                 stream=True,
             )
+        except requests.ConnectTimeout as exc:
+            raise InferenceError(
+                f"VLM server unreachable at {self.llm.base_url}: "
+                f"connect timed out after {self.llm.connect_timeout_s}s: {exc}"
+            ) from exc
         except requests.Timeout as exc:
             raise InferenceError(f"VLM stream timed out after {timeout}s: {exc}") from exc
         except requests.RequestException as exc:
@@ -320,6 +325,12 @@ class VlmClient:
                     json=payload,
                     headers={"Content-Type": "application/json"},
                     timeout=timeout,
+                )
+            except requests.ConnectTimeout as exc:
+                last_exc = InferenceError(
+                    f"VLM server unreachable at {self.llm.base_url}: "
+                    f"connect timed out after {self.llm.connect_timeout_s}s "
+                    f"(attempt {attempt}/{attempts}): {exc}"
                 )
             except requests.Timeout as exc:
                 last_exc = InferenceError(

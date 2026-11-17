@@ -66,7 +66,9 @@ textarea.input{width:100%;border:1px solid #d9e0e8;border-radius:7px;background:
 .message.placeholder .bubble-wrap small{color:#a8b1ba}
 .bubble-wrap .interrupt-note{display:block;font-size:10px;color:#a8762f;margin:6px 0 0;text-align:left}
 .user-message .bubble-wrap .interrupt-note{text-align:right}
-</style>
+.device-body{padding:16px 20px;display:flex;flex-direction:column;gap:8px}.device-body label{font-size:12px;color:#818b99}.device-body select{width:100%;min-width:0;padding:8px 10px;margin-bottom:6px;border:1px solid #d9e0e8;border-radius:7px;background:#f9fafc;color:#4c5c70;font-size:12px}.device-body select:disabled{opacity:.55}.device-card .cardhead button{font-size:11px;padding:3px 9px}#deviceMessage{font-size:11px;color:#8a6570;overflow-wrap:anywhere}#deviceMessage:empty{display:none}@media(min-width:851px){.layout{align-items:stretch}.layout>.stack{min-width:0}.layout>.stack:first-child>#integration{display:flex;flex-direction:column;flex:1;min-height:0}.layout #integration>.conversation{flex:1 1 240px;height:0;min-height:240px;max-height:none}.layout #integration>.cardhead,.layout #integration>.chat-controls{flex-shrink:0}.layout>.side>.device-card{display:flex;flex-direction:column;flex:1}.layout>.side>.device-card>.device-body{flex:1}}
+.device-picker{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;min-height:38px;text-align:left;font-size:12px;line-height:1.6;padding:8px 10px;margin-bottom:6px}.device-picker .device-name{white-space:normal;overflow-wrap:anywhere;min-width:0}.device-picker .chevron{flex-shrink:0;color:#8a96a5}.device-options{position:fixed;z-index:1000;background:#f9fafb;border:1px solid #ccd5e0;border-radius:9px;box-shadow:0 10px 35px #26395225;padding:5px;overflow-y:auto;overscroll-behavior:contain;box-sizing:border-box}.device-option{display:block;width:100%;border:0;border-radius:5px;text-align:left;white-space:normal;overflow-wrap:anywhere;line-height:1.6;padding:9px 12px;font-size:12px;color:#43536a}.device-option[aria-selected="true"]{background:#e1eaf6;color:#36567f}.device-option:focus-visible{outline:2px solid #7899c4;outline-offset:-2px}.device-native{display:none!important}
+.device-picker{height:38px;min-height:38px;max-height:38px;overflow:hidden}.device-picker .device-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;flex:1;min-width:0}.device-occupancy{font-size:10px;color:#8792a0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;height:17px;line-height:17px}.device-option{white-space:normal;overflow-wrap:anywhere}</style>
 </head>
 <body>
 <div class="shell">
@@ -88,7 +90,7 @@ textarea.input{width:100%;border:1px solid #d9e0e8;border-radius:7px;background:
 <div id="uploadPanel" class="hidden"><div class="upload-grid">
 <div class="upload-slot" data-slot="A"><div class="upload-box"><span>图片 A · 单图或第一件商品</span><img class="hidden" alt="上传图片 A"></div><div class="media-toolbar"><span class="small filename">未选择图片</span><div class="upload-actions"><button type="button" class="pick">选择图片</button><button type="button" class="remove" disabled>移除</button></div></div><input class="hidden image-file" type="file" accept="image/jpeg,image/png,image/webp"><div class="upload-error" aria-live="polite"></div></div>
 <div class="upload-slot" data-slot="B"><div class="upload-box"><span>图片 B · 双图比较时使用</span><img class="hidden" alt="上传图片 B"></div><div class="media-toolbar"><span class="small filename">未选择图片</span><div class="upload-actions"><button type="button" class="pick">选择图片</button><button type="button" class="remove" disabled>移除</button></div></div><input class="hidden image-file" type="file" accept="image/jpeg,image/png,image/webp"><div class="upload-error" aria-live="polite"></div></div>
-</div><p class="media-note">上传到目标机测试台：支持 JPEG、PNG、WebP，单张不超过 20 MB；上传只保存图片，不等于推理。</p></div>
+</div></div>
 </div></section>
 <section id="integration" class="card"><div class="cardhead"><h2>实时交互</h2><span id="runstate" class="runstate"><i class="dot gray"></i>未开始</span></div><div class="conversation" id="conversation" aria-live="polite"></div><div class="chat-controls"><div class="buttons"><button class="primary" id="start">▶ &nbsp;开始测试</button><button class="stop" id="stop" disabled>■ &nbsp;停止</button></div><span class="elapsed" id="elapsed">本轮时长 &nbsp;00:00</span><span class="small" id="conversationStatus">未开始测试</span></div></section>
 <section id="debug" class="card hidden"><div class="cardhead"><h2>模块调试</h2><span class="small">独立检查现有功能</span></div><div class="debugbody">
@@ -104,23 +106,24 @@ textarea.input{width:100%;border:1px solid #d9e0e8;border-radius:7px;background:
 
 </div><div class="stack side">
 <section class="card"><div class="cardhead"><h2>资源占用</h2><span class="small" id="resourceStatus">未连接</span></div><div class="resources">
-<div class="metric" id="metricRssRow"><div class="metrichead"><span>交互进程内存</span><strong id="metricRss">—</strong></div><div class="bar"><i id="barRss" style="width:0%"></i></div></div>
+<div class="metric" id="metricRssRow"><div class="metrichead"><span>三进程 RSS 合计（参考）</span><strong id="metricRss">—</strong></div><div class="bar" title="参考条：三进程 RSS 合计相对 4 GiB 的位置，不含子进程树/Swap/NvMap，不是预算占用率，也不表示预算达标" aria-hidden="true"><i id="barRss" style="width:0%"></i></div></div>
 <div class="metric" id="metricCpuRow"><div class="metrichead"><span>CPU</span><strong id="metricCpu">—</strong></div><div class="bar"><i id="barCpu" style="width:0%"></i></div></div>
 <div class="metric" id="metricGpuRow"><div class="metrichead"><span>GPU</span><strong id="metricGpu">—</strong></div><div class="bar"><i id="barGpu" style="width:0%"></i></div></div>
 <div class="metric"><div class="metrichead"><span>温度</span><strong id="metricTemp">—</strong></div></div>
-<div class="metric"><div class="metrichead"><span>测试台自身内存</span><strong id="metricBench">—</strong></div></div>
+<div class="metric"><div class="metrichead"><span>测试台自身 RSS</span><strong id="metricBench">—</strong></div></div>
 </div></section>
 <section class="card"><div class="cardhead"><h2>本轮模块耗时</h2><span class="small">ms</span></div><div class="timings" id="timings">
 <div><span>语音识别</span><strong id="timingAsr">—</strong></div>
 <div><span>取图 / 视觉 / OCR</span><strong id="timingVision">—</strong></div>
-<div><span>模型首段生成</span><strong id="timingGeneration">—</strong></div>
+<div><span>首段生成</span><strong id="timingGeneration">—</strong></div>
 <div><span>语音合成</span><strong id="timingTts">—</strong></div>
 <div><span>播放等待</span><strong id="timingPlaybackWait">—</strong></div>
 <div><span>端到端首声</span><strong class="total" id="timingAcoustic">未测量</strong></div>
-</div><div class="resourcefoot">实际发声需声学验证，软件事件不能替代。</div></section>
+</div></section>
+<section class="card device-card"><div class="cardhead"><h2>设备</h2><button id="refreshDevices" type="button" title="刷新目标机设备列表">刷新</button></div><div class="device-body"><label for="cameraDevice">摄像头</label><select id="cameraDevice"><option value="">设备列表未读取</option></select><label for="microphoneDevice">麦克风</label><select id="microphoneDevice"><option value="">设备列表未读取</option></select><label for="speakerDevice">扬声器</label><select id="speakerDevice"><option value="">设备列表未读取</option></select><span id="deviceMessage" role="status"></span></div></section>
 </div></div>
 <section class="card logs"><div class="cardhead"><h2>运行日志 </h2><div class="logtools"><select aria-label="日志级别" id="logFilter"><option value="all">全部级别</option><option value="INFO">INFO</option><option value="WARN">WARN</option></select><button id="clearLogs">清空显示</button></div></div><div class="logbody" id="logs" role="log" aria-live="polite"></div></section>
-<div class="bottom"><span>访问方式：本机浏览器 → 目标机测试台 → 目标机业务与设备</span><span>测试台全部文件：/home/mylin/Desktop/Nuo/testbench/</span></div>
+
 </main></div>
 <dialog id="confirm"><h3 id="confirmTitle">开始综合测试</h3><p id="confirmBody"></p><div class="buttons"><button type="button" id="cancelStart">取消</button><button type="button" class="primary" id="confirmStart">开始</button></div></dialog>
 <script src="app.js" defer></script>

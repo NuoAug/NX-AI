@@ -1,6 +1,6 @@
 """单工作进程监管：按需启动、按行 JSON 命令往返、进程归属校验与停止。
 
-设计约束（见 Docs/测试台/执行方案.md §4/§6）：
+设计约束（见 testbench/执行方案.md §4/§6）：
 
 * server 同一时刻最多持有一个 worker；worker 同时最多一个业务任务。
 * 启动前记录 pid / 进程组 / /proc 启动时间；停止前核对三项归属。
@@ -94,7 +94,7 @@ class WorkerProcess:
             env = os.environ.copy()
             env.update(
                 {
-                    "PYTHONPATH": str(self.project_root / "Src"),
+                    "PYTHONPATH": str(self.project_root / "src"),
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTHONUNBUFFERED": "1",
                     "XDG_CACHE_HOME": str(self.bench_dir / ".runtime" / "cache"),
@@ -106,6 +106,8 @@ class WorkerProcess:
                 }
             )
             env.update(self.extra_env)
+            from devices import prepare_env
+            prepare_env(env)
             for key in ("XDG_CACHE_HOME", "TMPDIR", "TMP", "CUDA_CACHE_PATH", "MPLCONFIGDIR"):
                 Path(env[key]).mkdir(parents=True, exist_ok=True)
             self._log_handle = open(self.log_path, "a", encoding="utf-8", buffering=1)
@@ -467,7 +469,7 @@ def worker_python(python_path: str) -> str:
 def default_env(project_root: Path, bench_dir: Path) -> dict[str, str]:
     runtime = bench_dir / ".runtime"
     return {
-        "PYTHONPATH": str(project_root / "Src"),
+        "PYTHONPATH": str(project_root / "src"),
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUNBUFFERED": "1",
         "PYTHONIOENCODING": "utf-8",

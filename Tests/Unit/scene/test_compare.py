@@ -89,3 +89,86 @@ def test_compare_default_question_checks_three_items():
     assert [item.name for item in result.items] == ["价格", "日期", "颜色"]
     assert "价格" in result.common_items
     assert "日期" in result.missing
+
+
+def test_compare_generic_question_uses_vlm_description():
+    """只说“帮我对比物品”时，结构化字段读不全也要给出两件物品的可见差异。"""
+    vlm = FakeVlm("A 是白色纸盒，B 是黑色塑料瓶；两者颜色和包装形状不同，B 更细长。")
+    service = SceneService(ocr=FakeOcr(by_frame={}), vlm=vlm)
+
+    result = service.compare(
+        make_frame(frame_id="a"), make_frame(frame_id="b"), "帮我对比物品"
+    )
+
+    assert "白色纸盒" in result.text
+    assert "B 更细长" in result.text
+    assert any(call["images"] == 1 for call in vlm.calls), vlm.calls
+    assert "左边是A" in vlm.calls[0]["prompt"]
+    assert result.a_tags and result.a_tags[0].kind == "vlm"
+    assert result.b_tags and result.b_tags[0].kind == "vlm"
+    assert "vlm_compare" in result.timings
+
+
+def test_compare_capacity_dimension_uses_vlm_even_with_old_price():
+    """补充“容量也算上”时不能因为旧问题里有价格就忽略容量。"""
+    vlm = FakeVlm("A 是五百毫升的小瓶，B 是一升装的大瓶，B 的容量明显更大。")
+    service = SceneService(
+        ocr=FakeOcr(by_frame={"a": ["价格 12.5元"], "b": ["价格 15元"]}), vlm=vlm
+    )
+
+    result = service.compare(
+        make_frame(frame_id="a"),
+        make_frame(frame_id="b"),
+        "比较一下这两瓶水的价格；容量也算上",
+    )
+
+    assert any(call["images"] == 1 for call in vlm.calls), vlm.calls
+    assert "容量明显更大" in result.text
+
+
+def test_compare_dropped_field_excludes_it():
+    """“不比价格，看日期”：明确删掉的维度不参与本次比较。"""
+    service = _service({"a": ["价格 12.5元"], "b": ["价格 15元"]})
+
+    result = service.compare(make_frame(frame_id="a"), make_frame(frame_id="b"), "不比价格，看日期")
+
+    assert [item.name for item in result.items] == ["日期"], result.items
+    assert "价格" not in result.common_items
+
+
+def test_compare_all_fields_excluded_asks_which():
+    """三项都被排除时问清要比哪一项，不擅自猜。"""
+    result = _service().compare(
+        make_frame(frame_id="a"), make_frame(frame_id="b"), "不比价格，不比日期，不比颜色"
+    )
+
+    assert "你想让我比哪一项" in result.text
+    assert result.degraded == ("no_compare_field",)
+
+
+def test_compare_explicit_price_question_does_not_use_vlm():
+    """明确问价格时仍只走 OCR 口径，不能让 VLM 编数字。"""
+    vlm = FakeVlm("A 是白色纸盒，B 是黑色塑料瓶，价格分别是 12 元和 9 元。")
+    service = SceneService(
+        ocr=FakeOcr(by_frame={"a": ["价格 12.5元"], "b": ["价格 15元"]}), vlm=vlm
+    )
+
+    result = service.compare(
+        make_frame(frame_id="a"), make_frame(frame_id="b"), "哪个更贵"
+    )
+
+    assert "白色纸盒" not in result.text
+    assert vlm.calls == []
+    assert "15元" in result.text
+
+
+def test_compare_generic_vlm_refusal_falls_back_to_structured_text():
+    service = SceneService(ocr=FakeOcr(by_frame={}), vlm=FakeVlm("看不清"))
+
+    result = service.compare(
+        make_frame(frame_id="a"), make_frame(frame_id="b"), "帮我对比物品"
+    )
+
+    assert "看不清" not in result.text
+    assert "颜色一样" in result.text
+    assert "vlm_compare_unclear" in result.degraded

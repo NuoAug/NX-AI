@@ -10,7 +10,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BENCH = HERE.parent
-SRC = BENCH.parent / "Src"
+SRC = BENCH.parent / "src"
 for path in (str(BENCH), str(SRC)):
     if path not in sys.path:
         sys.path.insert(0, path)
@@ -42,10 +42,10 @@ class EnvTests(unittest.TestCase):
     def test_default_env_directs_caches_into_bench(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "proj"
-            bench = project / "Testbench"
+            bench = project / "testbench"
             bench.mkdir(parents=True)
             env = supervisor_mod.default_env(project, bench)
-            self.assertEqual(env["PYTHONPATH"], str(project / "Src"))
+            self.assertEqual(env["PYTHONPATH"], str(project / "src"))
             self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertEqual(env["PYTHONUNBUFFERED"], "1")
             for key in ("XDG_CACHE_HOME", "TMPDIR", "CUDA_CACHE_PATH"):

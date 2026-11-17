@@ -14,6 +14,7 @@ cooldown 去抖。
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -156,6 +157,43 @@ def build_keywords_text(
     return "\n".join(lines) + ("\n" if lines else "")
 
 
+def _writable_dir(path: Path) -> bool:
+    """探测目录能否真的写入文件（``mkdir`` 成功不等于可创建文件）。"""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".write_probe_{os.getpid()}"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def keywords_cache_dir() -> Path:
+    """选关键词缓存目录：可写，且绝不落在当前工作目录（项目根）。
+
+    Windows 上 ``%TEMP%`` 被拒写时 ``tempfile.gettempdir()`` 会静默回落到
+    当前工作目录，历史上因此把 ``aieyes_kws/`` 建到项目根。这里显式排除
+    CWD，退到 ``<cwd>/.runtime/aieyes_kws``（仓库根 ``.gitignore`` 已忽略
+    ``.runtime/``）。环境变量 ``AIEYES_KWS_CACHE`` 可直接指定绝对路径。
+    """
+    override = os.environ.get("AIEYES_KWS_CACHE")
+    if override:
+        return Path(override).expanduser()
+    cwd = Path.cwd().resolve()
+    base = Path(tempfile.gettempdir())
+    try:
+        same_as_cwd = base.resolve() == cwd
+    except OSError:
+        same_as_cwd = True
+    if not same_as_cwd and _writable_dir(base / "aieyes_kws"):
+        return base / "aieyes_kws"
+    fallback = cwd / ".runtime" / "aieyes_kws"
+    if _writable_dir(fallback):
+        return fallback
+    return base / "aieyes_kws"
+
+
 def _pick_model_file(model_dir: Path, stem: str) -> Path:
     """按 int8 优先挑选 encoder/decoder/joiner onnx。"""
     for pattern in (f"{stem}.int8.onnx", f"{stem}*.int8.onnx", f"{stem}.onnx", f"{stem}*.onnx"):
@@ -212,7 +250,7 @@ class SherpaKws:
         text = build_keywords_text(tokens, self.cfg.wake_phrases, existing_lines=existing_lines)
         if not text.strip():
             raise ConfigError("唤醒词为空且模型自带 keywords.txt 无可用的行")
-        cache_dir = Path(tempfile.gettempdir()) / "aieyes_kws"
+        cache_dir = keywords_cache_dir()
         cache_dir.mkdir(parents=True, exist_ok=True)
         target = cache_dir / f"keywords_{abs(hash(text)) & 0xFFFFFFFF:08x}.txt"
         if not target.is_file() or target.read_text(encoding="utf-8") != text:

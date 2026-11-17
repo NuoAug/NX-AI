@@ -1,6 +1,6 @@
 """测试台媒体层：共享相机中枢、帧落盘、上传图片管理。
 
-职责边界（见 ``Testbench/执行方案.md`` 8.1/8.2）：
+职责边界（见 ``testbench/执行方案.md`` 8.1/8.2）：
 
 * :class:`CameraHub` —— 进程内唯一相机所有者。首个引用时启动唯一的采集线程并
   ``open()`` 相机，持续 ``grab()`` 缓存最新帧；按 ``preview_fps`` 上限把最新帧编码
@@ -47,6 +47,8 @@ _GRAB_TIMEOUT_MS = 1000
 _ERROR_BACKOFF_START_S = 0.1
 _ERROR_BACKOFF_MAX_S = 2.0
 _JOIN_TIMEOUT_S = 5.0
+# 连续这么多次 grab 失败就释放并重开设备（断连/拔插后恢复）。
+_RECONNECT_AFTER_FAILURES = 3
 
 _FRAME_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 _MAX_FRAME_ID_LEN = 120
@@ -54,7 +56,7 @@ _MAX_FRAME_ID_LEN = 120
 _ALLOWED_UPLOAD_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
 _SLOT_NAMES = ("A", "B")
 _UPLOAD_IMAGE_ID = re.compile(r"^[0-9a-f]{32}$")
-_UPLOAD_JPEG_QUALITY = 90
+_UPLOAD_JPEG_QUALITY = 95
 
 
 def _pillow_rgb(rgb: Any) -> Image.Image:
@@ -353,6 +355,9 @@ class CameraHub:
                     self._camera = camera
             backoff = _ERROR_BACKOFF_START_S
             opened = False
+            # 连续失败到阈值就认为句柄已失效（拔线/设备重置/驱动崩溃）并重开，
+            # 否则会永远在坏句柄上重试，画面再也回不来。
+            grab_failures = 0
             while not stop_event.is_set():
                 if not opened:
                     try:
@@ -372,8 +377,20 @@ class CameraHub:
                     frame = camera.grab(timeout_ms=_GRAB_TIMEOUT_MS)
                 except Exception as exc:  # noqa: BLE001 - grab 失败必须记录并重试
                     self._set_error(f"camera grab failed: {exc}")
+                    grab_failures += 1
+                    if grab_failures >= _RECONNECT_AFTER_FAILURES:
+                        grab_failures = 0
+                        opened = False
+                        with self._cond:
+                            self._camera_open = False
+                            self._cond.notify_all()
+                        try:
+                            camera.close()
+                        except Exception as close_exc:  # noqa: BLE001 - 释放失败只记录
+                            self._log_error(f"camera close failed: {close_exc}")
                     backoff = self._sleep_backoff(stop_event, backoff)
                     continue
+                grab_failures = 0
                 backoff = _ERROR_BACKOFF_START_S
                 now = self._clock()
                 t_ms = int(now * 1000)
@@ -619,7 +636,8 @@ class UploadStore:
         out_w, out_h = image.size
         image_id = secrets.token_hex(16)
         destination = self._dir / f"{image_id}.jpg"
-        image.save(destination, format="JPEG", quality=_UPLOAD_JPEG_QUALITY)
+        # 4:4:4 不做色度抽样：红色小字在 4:2:0 下会糊掉，OCR 读不出“高压”
+        image.save(destination, format="JPEG", quality=_UPLOAD_JPEG_QUALITY, subsampling=0)
 
         meta = {
             "image_id": image_id,

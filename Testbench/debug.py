@@ -1,6 +1,6 @@
 """功能调试模块：按固定白名单，用真实业务组件完成单项调试。
 
-契约（由 ``Testbench/worker.py`` 文件头约定，本文件不反向 import worker/server）：
+契约（由 ``testbench/worker.py`` 文件头约定，本文件不反向 import worker/server）：
 
 * ``MODULE_SPECS`` —— ``list[dict]``；每项包含 ``id`` / ``name`` / ``desc`` /
   ``fields`` / ``actions``，由 ``GET /api/debug/modules`` 原样返回给前端。
@@ -25,6 +25,7 @@ import queue
 import threading
 import time
 import traceback
+from concurrent.futures import CancelledError
 from pathlib import Path
 from typing import Any
 
@@ -296,6 +297,10 @@ class _EmitAdapter:
 # ---------------------------------------------------------------------------
 # 调试执行器
 # ---------------------------------------------------------------------------
+class _DebugCancelled(Exception):
+    """Internal stop boundary; cancellation is not a component failure."""
+
+
 class DebugRunner:
     """一次功能调试：负责参数校验、后台执行、动作分发与资源释放。"""
 
@@ -428,10 +433,13 @@ class DebugRunner:
         status = "completed"
         error = ""
         try:
+            self._check_stopped()
             handler = getattr(self, f"_run_{self._module}", None)
             if not callable(handler):
                 raise DebugError("invalid_module", f"调试模块未实现：{self._module}")
             handler()
+        except (_DebugCancelled, CancelledError):
+            status = "interrupted"
         except DebugError as exc:
             status = "failed"
             error = exc.message
@@ -468,6 +476,10 @@ class DebugRunner:
             pass
 
     # -- 资源 -----------------------------------------------------------
+    def _check_stopped(self) -> None:
+        if self.ctx.stopped:
+            raise _DebugCancelled()
+
     def _track(self, label: str, obj: Any, method: str = "close") -> Any:
         if obj is None:
             return None
@@ -498,6 +510,8 @@ class DebugRunner:
     def _emit(self, etype: str, payload: dict | None = None) -> None:
         if etype not in _DEBUG_EVENT_TYPES:
             return
+        if etype.startswith('assistant.') and getattr(self.ctx,'stopped',False):
+            return
         try:
             self.ctx.emit(etype, payload or {})
         except Exception:  # noqa: BLE001
@@ -518,6 +532,8 @@ class DebugRunner:
         return getattr(self.cfg, "audio", None)
 
     def _make_source(self) -> Any:
+        from devices import require_audio
+        require_audio('microphone')
         from aieyes.audio.capture import SoundDeviceSource
 
         audio = self._audio_cfg()
@@ -525,21 +541,23 @@ class DebugRunner:
             audio,
             sample_rate=int(getattr(audio, "sample_rate", 16000) or 16000),
             frame_ms=int(getattr(audio, "frame_ms", 20) or 20),
-            device=None,  # 固定使用系统默认设备
+            device=getattr(audio, "input_device", None),
         )
 
     def _make_sink(self, sample_rate: int) -> Any:
+        from devices import require_audio
+        require_audio('speaker')
         from aieyes.audio.output import AudioSink
 
-        return AudioSink(device=None, sample_rate=sample_rate)
+        return AudioSink(device=getattr(self._audio_cfg(), "output_device", None), sample_rate=sample_rate)
 
     def _make_kws(self) -> Any:
-        from aieyes.speech.kws import SherpaKws
+        from kws_adapter import SherpaKws
 
         return SherpaKws(getattr(self.cfg, "kws", None), getattr(self.cfg, "models", None))
 
     def _make_vad(self) -> Any:
-        from aieyes.audio.vad import EnergyVad
+        from speech_vad import SpeechVad as EnergyVad
 
         audio = self._audio_cfg()
         return EnergyVad(
@@ -549,7 +567,7 @@ class DebugRunner:
         )
 
     def _make_asr(self) -> Any:
-        from aieyes.speech.asr import StreamingAsr
+        from asr_adapter import StreamingAsr
 
         return StreamingAsr(getattr(self.cfg, "asr", None), getattr(self.cfg, "models", None))
 
@@ -562,15 +580,17 @@ class DebugRunner:
         return self.ctx.vlm_client()
 
     def _make_chat(self, vlm: Any) -> Any:
-        from aieyes.chat import ChatSession
+        from chat_adapter import make_chat
 
-        return ChatSession(vlm)
+        return make_chat(vlm)
 
     def _make_scene(self) -> Any:
-        from aieyes.scene.service import SceneService
-        from aieyes.vision.ocr import OcrEngine
+        self._check_stopped()
+        from scene_guard import SceneService
+        from ocr_adapter import OcrEngine
 
         vlm = self._track("vlm", self._make_vlm())
+        self._check_stopped()
         ocr = None
         models = getattr(self.cfg, "models", None)
         resolve = getattr(models, "resolve", None)
@@ -585,8 +605,10 @@ class DebugRunner:
             self._track("ocr", ocr)
         except Exception as exc:  # noqa: BLE001 - OCR 不可用时交给 SceneService 惰性默认
             self._log("WARN", f"OCR 组件初始化失败：{exc}")
+        self._check_stopped()
         scene = SceneService(vlm=vlm, ocr=ocr)
         self._track("scene", scene)
+        self._check_stopped()
         return scene
 
     def _make_gate(self) -> Any:
@@ -880,10 +902,22 @@ class DebugRunner:
         self._log("INFO", "调用 ChatSession 生成文本回答（不自动 TTS）…")
         vlm = self._track("vlm", self._make_vlm())
         chat = self._make_chat(vlm)
+        self._check_stopped()
         started = time.monotonic()
-        answer = chat.ask(text)
+        if callable(getattr(chat, "ask_stream", None)):
+            parts = []
+            for delta in chat.ask_stream(text):
+                if self.ctx.stopped:
+                    return
+                parts.append(str(delta))
+                self._emit("assistant.delta", {"text": str(delta), "source": "debug"})
+            answer_text = "".join(parts)
+        else:
+            answer = chat.ask(text)
+            answer_text = _as_text(getattr(answer, "text", ""))
+        if self.ctx.stopped:
+            return
         generation_ms = int((time.monotonic() - started) * 1000)
-        answer_text = _as_text(getattr(answer, "text", ""))
         self._emit(
             "assistant.final",
             {"text": answer_text, "cancelled": False, "source": "debug"},
@@ -1002,6 +1036,7 @@ class DebugRunner:
         self._log("INFO", f"SceneService 视觉问答（来源：{source}）…")
         frame, _meta = self._acquire_frame(source, "vision")
         scene = self._make_scene()
+        self._check_stopped()
         started = time.monotonic()
         answer = scene.answer(question, frame=frame)
         elapsed = int((time.monotonic() - started) * 1000)
@@ -1030,6 +1065,7 @@ class DebugRunner:
         self._log("INFO", f"OCR/解析（来源：{source}）…")
         frame, _meta = self._acquire_frame(source, "ocr")
         scene = self._make_scene()
+        self._check_stopped()
         ocr_started = time.monotonic()
         result = scene.read_text_result(frame)
         ocr_ms = int(getattr(result, "t_ms", 0) or ((time.monotonic() - ocr_started) * 1000))
@@ -1048,6 +1084,7 @@ class DebugRunner:
         else:
             self._log("WARN", "OCR 未识别到文字。")
         self._timing(ocr_ms=ocr_ms)
+        self._check_stopped()
         started = time.monotonic()
         answer = scene.answer(question, frame=frame)
         elapsed = int((time.monotonic() - started) * 1000)
@@ -1111,6 +1148,7 @@ class DebugRunner:
     def _compare_frames(self, frame_a: Any, frame_b: Any, question: str) -> None:
         self._log("INFO", "调用 SceneService 比较能力…")
         scene = self._make_scene()
+        self._check_stopped()
         started = time.monotonic()
         answer = scene.compare(frame_a, frame_b, question)
         elapsed = int((time.monotonic() - started) * 1000)
@@ -1337,17 +1375,19 @@ class DebugRunner:
     def _build_interruption_bundle(self) -> dict[str, Any]:
         from aieyes.app import _make_source, build_engine
         from aieyes.audio.output import AudioSink
-        from aieyes.audio.vad import EnergyVad
-        from aieyes.chat import ChatSession
+        from speech_vad import SpeechVad as EnergyVad
+        from chat_adapter import make_chat
+        from intent_adapter import install
+        install()
         from aieyes.events import EventBus
         from aieyes.scene.providers import CameraFrameProvider
-        from aieyes.scene.service import SceneService
-        from aieyes.speech.asr import StreamingAsr
+        from scene_guard import SceneService
+        from asr_adapter import StreamingAsr
         from aieyes.speech.frontend import SpeechFrontend
-        from aieyes.speech.kws import SherpaKws
+        from kws_adapter import SherpaKws
         from aieyes.speech.tts import PiperTts
-        from aieyes.vision.ocr import OcrEngine
-        from aieyes.vision.vlm import VlmClient
+        from ocr_adapter import OcrEngine
+        from vlm_adapter import VlmClient
 
         from bridge import Bridge
         from media import CameraHubAdapter
@@ -1369,13 +1409,13 @@ class DebugRunner:
         provider = bridge.wrap_provider(
             CameraFrameProvider(camera=CameraHubAdapter(hub, reason="debug"))
         )
-        vlm = VlmClient(cfg.llm, cfg.vlm)
+        vlm = VlmClient(cfg.llm, cfg.vlm, cancel_event=getattr(self.ctx, "stop_event", None))
         ocr = OcrEngine(cfg.ocr, ocr_dir=cfg.models.resolve(cfg.models.ocr_dir))
         scene = SceneService(vlm=vlm, ocr=ocr, provider=provider)
         observed_scene = bridge.wrap_scene(scene)
-        observed_chat = bridge.wrap_chat(ChatSession(vlm))
+        observed_chat = bridge.wrap_chat(make_chat(vlm))
         observed_tts = bridge.wrap_tts(PiperTts(cfg.tts, cfg.models))
-        sink = AudioSink(device=None, sample_rate=cfg.audio.sample_rate)
+        sink = AudioSink(device=cfg.audio.output_device, sample_rate=cfg.audio.sample_rate)
         frontend = SpeechFrontend(
             _make_source(cfg),
             kws=SherpaKws(cfg.kws, cfg.models),

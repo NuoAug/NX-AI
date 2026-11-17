@@ -178,10 +178,12 @@ class FakeScene:
         self.compare_calls: list[tuple[object, object, str]] = []
         self.compare_error: Exception | None = None
         self.compare_delay_s = 0.0
+        self.answer_frames: list[object | None] = []
 
-    def answer(self, question: str, *, intent_hint: str | None = None):
+    def answer(self, question: str, *, intent_hint: str | None = None, frame: object | None = None):
         self.questions.append(question)
         self.intent_hints.append(intent_hint)
+        self.answer_frames.append(frame)
         if self.delay_s:
             time.sleep(self.delay_s)
         if self.error is not None:
@@ -227,6 +229,21 @@ class FakeProvider:
             frame_id=f"f-{len(self.calls)}",
             source="file",
         )
+
+
+class FailingProvider(FakeProvider):
+    """按第几次 acquire 注入失败，用于验证失败保留与有界重试。"""
+
+    def __init__(self, fail_on: dict[int, Exception]) -> None:
+        super().__init__()
+        self.fail_on = dict(fail_on)
+
+    def acquire(self, purpose: str = "vqa") -> ImageFrame:
+        call = len(self.calls) + 1
+        if call in self.fail_on:
+            self.calls.append(purpose)
+            raise self.fail_on[call]
+        return super().acquire(purpose)
 
 
 def _records(engine: InteractionEngine, name: str) -> list[dict]:
@@ -361,6 +378,34 @@ def test_barge_in_stops_playback() -> None:
         assert sink.cancel_calls > cancels_before, "插话必须让播放出口真正停声"
         await _wait_until(lambda: not sink.is_playing, timeout=2.0)
         await _wait_until(lambda: engine.state is InteractionState.LISTENING, timeout=2.0)
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_guidance_single_stop_is_spoken_as_xiating() -> None:
+    """停步提示统一说“停下”：主控只发单字“停”时，播报端补成两字并留证据。"""
+    from types import SimpleNamespace
+
+    async def scenario() -> None:
+        engine, _frontend, sink, tts, _ = _make_engine()
+        await engine.start()
+        event = SimpleNamespace(
+            data={
+                "event_id": "evt-stop",
+                "priority": "emergency",
+                "text": "停",
+                "valid_until_mono_ms": mono_ms() + 5000,
+            },
+            clock_id=None,
+            evidence_mode="synthetic",
+        )
+        await engine.handle_guidance_event(event)
+        await _wait_until(lambda: "停下。" in tts.calls)
+        assert any(text == "停下。" for _pid, text in sink.played)
+        assert not any(text.strip() == "停" for _pid, text in sink.played)
+        rewritten = _records(engine, "guidance.event")
+        assert rewritten and rewritten[-1]["text_rewritten"] is True
         await engine.stop()
 
     asyncio.run(scenario())
@@ -605,6 +650,16 @@ def test_compare_intent_runs_compare_and_speaks() -> None:
         frontend.on_wake("小冰", mono_ms())
         await _wait_until(lambda: engine.state is InteractionState.LISTENING)
         frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        assert provider.calls == [], provider.calls
+        assert scene.compare_calls == []
+        await _wait_until(lambda: any("第一件" in text for _pid, text in sink.played))
+        frontend.on_utterance(Utterance("继续", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_second")))
+        assert provider.calls == ["vqa"], provider.calls
+        assert scene.compare_calls == []
+        await _wait_until(lambda: any("第二件" in text for _pid, text in sink.played))
+        frontend.on_utterance(Utterance("继续", mono_ms(), mono_ms(), mono_ms()))
         await _wait_until(lambda: bool(_records(engine, "compare.answer")))
         assert len(scene.compare_calls) == 1
         assert provider.calls == ["vqa", "vqa"], provider.calls
@@ -613,6 +668,590 @@ def test_compare_intent_runs_compare_and_speaks() -> None:
         assert rec["common"] == "price" and rec["a_frame"] == "f-1" and rec["b_frame"] == "f-2", rec
         task = engine.image_tasks.tasks[0]
         assert task.state == "answered" and engine.image_tasks.unfinished() == []
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_waiting_accepts_noisy_continue() -> None:
+    """双图等待中 ASR 把“继续”识成“嗯继”也要恢复拍摄，不能掉进聊天。"""
+
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        frontend.on_utterance(Utterance("嗯继", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_second")))
+        assert provider.calls == ["vqa"], provider.calls
+        assert _records(engine, "compare.resume_ready"), _records(engine, "compare.resume_ready")
+        assert scene.compare_calls == []
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_waiting_accepts_short_yes() -> None:
+    """等待拍摄时说“好/好的/行”是最自然的确认，不能掉成聊天或“我在，请说”。"""
+
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("帮我对比物品", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        frontend.on_utterance(Utterance("好", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_second")))
+        assert provider.calls == ["vqa"], provider.calls
+        assert _records(engine, "compare.resume_ready"), _records(engine, "compare.resume_ready")
+        assert not _records(engine, "chat"), "短确认不应提交聊天模型"
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_ready_and_reshoot_reject_negation() -> None:
+    async def scenario() -> None:
+        engine, _frontend, _sink, _tts, _ = _make_engine()
+        assert engine._looks_like_compare_ready("好了")
+        for text in ("好", "好的", "好嘞", "行", "可以", "嗯好"):
+            assert engine._looks_like_compare_ready(text), text
+        for text in ("不好", "好看", "好的，等一下", "不可以", "还没好"):
+            assert not engine._looks_like_compare_ready(text), text
+        assert not engine._looks_like_compare_ready("还没准备好")
+        assert not engine._looks_like_compare_ready("等一下")
+        task = engine.image_tasks.open_compare("比较这两件")
+        engine._last_compare_task = task
+        assert engine._looks_like_compare_repair("重拍第一件")
+        assert not engine._looks_like_compare_repair("别重拍")
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_natural_expression_detection() -> None:
+    """自然说法按阶段判意：准备完成 / 保持 / 暂停 / 放弃 / 补充 / 对调。"""
+    async def scenario() -> None:
+        engine, _frontend, _sink, _tts, _ = _make_engine()
+        for text in ("换好了", "现在是另一件", "第二个放上去了", "来，看这个", "可以看了", "第二个好了"):
+            assert engine._looks_like_compare_ready(text), text
+        for text in ("等一下", "我还没换好", "先别拍", "这个还没摆正", "第二个还没好", "不要继续"):
+            assert not engine._looks_like_compare_ready(text), text
+            assert engine._looks_like_compare_hold(text), text
+        assert engine._looks_like_compare_pause("先放着，聊点别的")
+        assert not engine._looks_like_compare_abandon("先放着，聊点别的")
+        assert not engine._looks_like_compare_hold("先不比价格，看日期")
+        assert engine._looks_like_compare_refine("先不比价格，看日期")
+        assert engine._looks_like_compare_abandon("算了，不比了")
+        assert engine._looks_like_compare_refine("只比价格")
+        assert engine._looks_like_compare_refine("容量也算上")
+        assert engine._looks_like_compare_refine("看看哪个更划算")
+        assert engine._looks_like_compare_refine("不比价格了，看日期")
+        assert not engine._looks_like_compare_refine("比较一下这两瓶水的价格")
+        assert engine._looks_like_compare_swap("不是第二个，是第一个")
+        assert engine._looks_like_compare_swap("刚才说反了，左边那个才是第一件")
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+async def _run_compare_to_answer(engine, frontend, scene) -> None:
+    frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+    await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+    frontend.on_utterance(Utterance("好了", mono_ms(), mono_ms(), mono_ms()))
+    await _wait_until(lambda: bool(_records(engine, "compare.wait_second")))
+    frontend.on_utterance(Utterance("好了", mono_ms(), mono_ms(), mono_ms()))
+    await _wait_until(lambda: bool(_records(engine, "compare.answer")))
+
+
+def test_compare_waiting_hold_never_captures_or_chats() -> None:
+    """等待时说“还没换好/先别拍/等一下”只保持等待，不采集、不推进、不聊天。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        holds = ("等一下", "我还没换好", "先别拍", "这个还没摆正", "先看第二个，等一下，还是先别拍")
+        for index, text in enumerate(holds, start=1):
+            frontend.on_utterance(Utterance(text, mono_ms(), mono_ms(), mono_ms()))
+            await _wait_until(lambda: len(_records(engine, "compare.hold")) == index)
+            assert provider.calls == [], f"{text} 触发了取图: {provider.calls}"
+            assert not _records(engine, "chat"), f"{text} 掉进了聊天"
+            assert engine._last_compare_task.pause_reason == "waiting_first"
+        frontend.on_utterance(Utterance("换好了", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_second")))
+        assert provider.calls == ["vqa"], provider.calls
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_refine_reuses_pair_without_recapture() -> None:
+    """答完后说“只比价格”：复用两件旧帧重新比较，不重拍。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        await _run_compare_to_answer(engine, frontend, scene)
+        calls_before = list(provider.calls)
+        scene.compare_calls.clear()
+        frontend.on_utterance(Utterance("只比价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: len(scene.compare_calls) == 1)
+        assert provider.calls == calls_before, f"补充比较项却重拍了: {provider.calls}"
+        frame_a, frame_b, question = scene.compare_calls[0]
+        assert (frame_a.frame_id, frame_b.frame_id) == ("f-1", "f-2"), scene.compare_calls
+        assert "价格" in question, question
+        await _wait_until(lambda: len(_records(engine, "compare.answer")) == 2)
+        assert engine.image_tasks.unfinished() == []
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_pause_keeps_task_and_ready_resumes() -> None:
+    """“先放着”是暂停不是结束；随后“好了”接着拍第二件，不重拍第一件。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        frontend.on_utterance(Utterance("好了", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_second")))
+        frontend.on_utterance(Utterance("先放着，聊点别的", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.pause")))
+        task = engine._last_compare_task
+        assert task is not None and task.pause_reason == "user_pause"
+        assert not task.finished, "暂停不应结束任务"
+        assert provider.calls == ["vqa"], provider.calls
+        frontend.on_utterance(Utterance("好了", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.answer")))
+        assert provider.calls == ["vqa", "vqa"], "恢复时应只补拍第二件"
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_abandon_then_continue_does_not_revive() -> None:
+    """“算了，不比了”是结束；之后“继续”不能复活旧比较。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        frontend.on_utterance(Utterance("算了，不比了", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.abandon")))
+        assert engine._last_compare_task is None
+        assert all(task.finished for task in engine.image_tasks.tasks)
+        frontend.on_utterance(Utterance("继续", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: any("没有要接着看的图" in text for _pid, text in sink.played))
+        assert provider.calls == [], provider.calls
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_recall_answers_from_existing_frame_without_reset() -> None:
+    """“第一件叫什么”用第一件的图回答，比较任务状态不变。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        await _run_compare_to_answer(engine, frontend, scene)
+        task = engine._last_compare_task
+        assert task is not None
+        state_before = task.state
+        scene.answer_frames.clear()
+        frontend.on_utterance(Utterance("第一件叫什么", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.recall")))
+        assert scene.answer_frames and scene.answer_frames[-1] is task.frames["A"]
+        assert task.state == state_before, "插问不应重置比较任务"
+        assert len(scene.compare_calls) == 1, "插问不应重新比较"
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_recall_ambiguous_asks_one_question() -> None:
+    """“刚才那个多少钱”指向不明时只问一件澄清，随后按位置回答。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        await _run_compare_to_answer(engine, frontend, scene)
+        scene.answer_frames.clear()
+        frontend.on_utterance(Utterance("刚才那个多少钱", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.recall_clarify")))
+        await _wait_until(lambda: any("第一件还是第二件" in text for _pid, text in sink.played))
+        assert scene.answer_frames == [], "澄清前不应猜对象去回答"
+        frontend.on_utterance(Utterance("第二件", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.recall")))
+        task = engine._last_compare_task
+        assert task is not None and scene.answer_frames[-1] is task.frames["B"]
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_swap_correction_reuses_frames() -> None:
+    """“不是第二个，是第一个”：只交换 A/B 归属，不重拍。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        await _run_compare_to_answer(engine, frontend, scene)
+        assert scene.compare_calls[0][0].frame_id == "f-1"
+        calls_before = list(provider.calls)
+        scene.compare_calls.clear()
+        frontend.on_utterance(Utterance("不是第二个，是第一个", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.swap")))
+        await _wait_until(lambda: len(scene.compare_calls) == 1)
+        assert provider.calls == calls_before, f"纠正不应重拍: {provider.calls}"
+        frame_a, frame_b, _question = scene.compare_calls[0]
+        assert (frame_a.frame_id, frame_b.frame_id) == ("f-2", "f-1"), scene.compare_calls
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_reference_correction_after_recall_does_not_swap() -> None:
+    """先问第二件，随后“不是第二个，是第一个”是改指代，不是交换 A/B。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        await _run_compare_to_answer(engine, frontend, scene)
+        task = engine._last_compare_task
+        assert task is not None
+        scene.answer_frames.clear()
+        frontend.on_utterance(Utterance("第二件是什么", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.recall")))
+        assert scene.answer_frames[-1] is task.frames["B"]
+        scene.answer_frames.clear()
+        frontend.on_utterance(Utterance("不是第二个，是第一个", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.reference_corrected")))
+        await _wait_until(lambda: len(scene.answer_frames) == 1)
+        assert scene.answer_frames[-1] is task.frames["A"], "改指代后应回答第一件"
+        assert not _records(engine, "compare.swap"), "不应交换 A/B"
+        assert len(scene.compare_calls) == 1, "不应重新比较"
+        assert task.frames["A"].frame_id == "f-1" and task.frames["B"].frame_id == "f-2"
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_reshoot_pending_accepts_bare_position() -> None:
+    """问“重拍哪一件”后，用户只答“第二件”也应执行，不需要固定口令。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        await _run_compare_to_answer(engine, frontend, scene)
+        calls_before = list(provider.calls)
+        scene.compare_calls.clear()
+        frontend.on_utterance(Utterance("重拍", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.reshoot_clarify")))
+        frontend.on_utterance(Utterance("第二件", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.reshoot_pending_answer")))
+        await _wait_until(lambda: len(scene.compare_calls) == 1)
+        assert provider.calls[len(calls_before):] == ["vqa"], provider.calls
+        frame_a, frame_b, _question = scene.compare_calls[0]
+        assert frame_a.frame_id == "f-1", "第一件被一起重拍了"
+        assert frame_b.frame_id == "f-3", "第二件没有取新帧"
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_swap_without_evidence_asks_clarify() -> None:
+    """没有上一轮比较归属证据时，不因“不是第二个，是第一个”就交换全部对象。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        before = list(provider.calls)
+        frontend.on_utterance(Utterance("不是第二个，是第一个", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.swap_clarify")))
+        assert provider.calls == before, "澄清前不应取图"
+        assert not _records(engine, "compare.swap")
+        await _wait_until(lambda: any("对调" in text for _pid, text in sink.played))
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_reshoot_after_answer_regrabs_only_named_position() -> None:
+    """“第二张不清楚，重来一次”：复用第一件，只重拍第二件。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        await _run_compare_to_answer(engine, frontend, scene)
+        calls_before = list(provider.calls)
+        scene.compare_calls.clear()
+        frontend.on_utterance(Utterance("第二张不清楚，重来一次", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.reshoot_reuse_pair")))
+        await _wait_until(lambda: len(scene.compare_calls) == 1)
+        assert provider.calls[len(calls_before):] == ["vqa"], provider.calls
+        frame_a, frame_b, _question = scene.compare_calls[0]
+        assert frame_a.frame_id == "f-1", "第一件被一起重拍了"
+        assert frame_b.frame_id == "f-3", f"第二件没有取新帧: {frame_b.frame_id}"
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+
+def test_compare_waiting_questions_and_negation_never_capture() -> None:
+    """等待拍摄时，疑问/否定/不确定/引用不能被“准备/拍”等词抢先消费。"""
+    cases = (
+        "第一件是什么",
+        "好了，不过先别拍",
+        "别继续拍",
+        "准备好了没有我不知道",
+        "我刚才说“继续”，不是现在让你拍",
+        "第一件是什么，放好了",
+    )
+
+    async def scenario() -> None:
+        for text in cases:
+            provider = FakeProvider()
+            scene = FakeScene(provider=provider)
+            engine, frontend, sink, _tts, _ = _make_engine(scene=scene)
+            await engine.start()
+            frontend.on_wake("小冰", mono_ms())
+            await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+            frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+            await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+            before = list(provider.calls)
+            frontend.on_utterance(Utterance(text, mono_ms(), mono_ms(), mono_ms()))
+            await asyncio.sleep(0.2)
+            assert provider.calls == before, f"{text!r} 被当成准备完成并取图: {provider.calls}"
+            assert not _records(engine, "chat"), f"{text!r} 掉进聊天"
+            assert sink.played, f"{text!r} 没有任何声音反馈"
+            await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_waiting_self_correction_final_intent_wins() -> None:
+    """同一句里先否定后确认：最终明确意愿是拍，才推进；先确认后否定则保持等待。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+
+        frontend.on_utterance(Utterance("先别拍，现在好了，可以拍了", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_second")))
+        assert provider.calls == ["vqa"], provider.calls
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_waiting_status_question_answers_from_state() -> None:
+    """“你在等什么/现在到哪一步了”直接答实际状态，不取图、不交模型。"""
+    async def scenario() -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        before = list(provider.calls)
+        frontend.on_utterance(Utterance("你在等什么", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.status")))
+        assert provider.calls == before, provider.calls
+        await _wait_until(lambda: any("第一件" in text for _pid, text in sink.played))
+        assert not _records(engine, "chat")
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_second_capture_failure_keeps_first_item() -> None:
+    """第二件拍摄失败：第一件保留，给一个调整动作，重试只补第二件。"""
+    async def scenario() -> None:
+        from aieyes.scene.errors import FrameQualityError
+        from aieyes.vision.quality import QualityReport
+
+        report = QualityReport(
+            width=4, height=4, blur_score=0.0, brightness=10.0,
+            size_ok=True, labels=("dark",),
+        )
+        provider = FailingProvider({2: FrameQualityError("画面太暗", report=report)})
+        scene = FakeScene(provider=provider)
+        engine, frontend, sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        frontend.on_utterance(Utterance("好了", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_second")))
+        frontend.on_utterance(Utterance("好了", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.capture_failed")))
+
+        task = engine._last_compare_task
+        assert task is not None
+        assert task.frames.get("A") is not None, "第一件被一起丢掉了"
+        assert task.frames.get("B") is None
+        assert task.pause_reason == "capture_failed_second", task.pause_reason
+        assert not task.finished
+        await _wait_until(lambda: any("第一件还保留" in text for _pid, text in sink.played))
+        spoken = "".join(text for _pid, text in sink.played)
+        assert "画面太暗" in spoken and "亮一点" in spoken, spoken
+
+        provider.fail_on.clear()
+        scene.compare_calls.clear()
+        frontend.on_utterance(Utterance("好了", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: len(scene.compare_calls) == 1)
+        assert provider.calls == ["vqa", "vqa", "vqa"], provider.calls
+        assert scene.compare_calls[0][0].frame_id == "f-1"
+        assert scene.compare_calls[0][1].frame_id == "f-3", "重试应只补第二件"
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compare_first_capture_failure_can_retry() -> None:
+    """第一件拍摄失败：任务保留，明确原因；重试只补第一件再等第二件。"""
+    async def scenario() -> None:
+        from aieyes.scene.errors import FrameAcquisitionError
+
+        provider = FailingProvider({1: FrameAcquisitionError("没有取得画面")})
+        scene = FakeScene(provider=provider)
+        engine, frontend, sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        frontend.on_utterance(Utterance("好了", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.capture_failed")))
+
+        task = engine._last_compare_task
+        assert task is not None
+        assert not task.finished and task.frames.get("A") is None
+        assert task.pause_reason == "capture_failed_first", task.pause_reason
+        await _wait_until(lambda: any("第一件这次没拍到" in text for _pid, text in sink.played))
+
+        provider.fail_on.clear()
+        frontend.on_utterance(Utterance("好了", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_second")))
+        assert provider.calls == ["vqa", "vqa"], provider.calls
+        assert task.frames.get("A") is not None
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_capture_failure_guidance_is_single_action() -> None:
+    """质量标签映射成一个动作，不猜左右/距离。"""
+    from aieyes.scene.errors import FrameQualityError
+    from aieyes.vision.quality import QualityReport
+
+    def guidance(labels):
+        report = QualityReport(
+            width=4, height=4, blur_score=0.0, brightness=10.0,
+            size_ok=True, labels=tuple(labels),
+        )
+        return InteractionEngine._capture_failure_guidance(FrameQualityError("x", report=report))
+
+    assert "亮一点" in guidance(("dark",))[1]
+    assert "强光" in guidance(("bright",))[1]
+    assert "放稳" in guidance(("blurry",))[1]
+    assert "靠近镜头" in guidance(("too_small",))[1]
+    assert "拿远一点" in guidance(("too_large",))[1]
+    for _reason, action in (guidance(("dark",)), guidance(("blurry",))):
+        assert "左" not in action and "右" not in action and "向前" not in action
+
+
+def test_compare_waiting_global_controls_not_swallowed() -> None:
+    """停止/清除/取消不能被“好了/拍/准备”等宽泛词吞掉。"""
+    async def run_one(text: str, marker: str) -> None:
+        provider = FakeProvider()
+        scene = FakeScene(provider=provider)
+        engine, frontend, _sink, _tts, _ = _make_engine(scene=scene)
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("比较一下这两瓶水的价格", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "compare.wait_first")))
+        before = list(provider.calls)
+        frontend.on_utterance(Utterance(text, mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, marker)))
+        assert provider.calls == before, f"{text!r} 被当成准备完成: {provider.calls}"
+        await engine.stop()
+
+    async def scenario() -> None:
+        await run_one("清除资料，好了", "materials.cleared")
+        await run_one("停止，好了", "stop.silenced")
+        await run_one("取消比较", "compare.abandon")
+
+    asyncio.run(scenario())
+
+
+def test_garbled_filler_asks_to_repeat() -> None:
+    async def scenario() -> None:
+        engine, frontend, sink, _tts, _ = _make_engine()
+        await engine.start()
+        frontend.on_wake("小冰", mono_ms())
+        await _wait_until(lambda: engine.state is InteractionState.LISTENING)
+        frontend.on_utterance(Utterance("这个傻一点千是", mono_ms(), mono_ms(), mono_ms()))
+        await _wait_until(lambda: bool(_records(engine, "chat.unclear")))
+        await _wait_until(lambda: any("没听清" in text for _pid, text in sink.played))
         await engine.stop()
 
     asyncio.run(scenario())
@@ -752,6 +1391,9 @@ def test_clear_denied_when_identity_not_verified() -> None:
         await _wait_until(lambda: engine.state is InteractionState.LISTENING)
         frontend.on_utterance(Utterance("清空对话", mono_ms(), mono_ms(), mono_ms()))
         await _wait_until(lambda: bool(_records(engine, "materials.clear_denied")))
+        # 拒绝话术是异步播出（_speak → _speech_worker → tts.synth 在线程里跑），
+        # 记录落库早于 sink.play，必须等它真的进播放器再断言，否则断言的是时序不是行为。
+        await _wait_until(lambda: any("得先确认是你本人" in text for _pid, text in sink.played))
         assert any("得先确认是你本人" in text for _pid, text in sink.played)
         assert _records(engine, "materials.cleared") == []
         assert len(chat.turns) == 1, "未确认身份不得清除资料"
@@ -776,6 +1418,7 @@ def test_clear_removes_chat_and_image_tasks_when_verified() -> None:
         assert cleared["turns"] == 1 and cleared["tasks"] == 1
         assert chat.turns == [] and engine.image_tasks.tasks == []
         assert tts.clear_calls == 1
+        await _wait_until(lambda: any("都清掉了" in text for _pid, text in sink.played))
         assert any("都清掉了" in text for _pid, text in sink.played)
         await engine.stop()
 
@@ -873,6 +1516,8 @@ def test_resume_denied_without_identity_access() -> None:
         await _wait_until(lambda: bool(_records(engine, "materials.resume_denied")))
         assert _records(engine, "compare.resume") == []
         assert task.state == "paused"
+        # 同上：resume_denied 话术晚一拍进播放器。
+        await _wait_until(lambda: any("得先确认是你本人" in text for _pid, text in sink.played))
         assert any("得先确认是你本人" in text for _pid, text in sink.played)
         await engine.stop()
 

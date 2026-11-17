@@ -63,7 +63,7 @@
 | `Tools/build_llama.sh` | 目标板构建 CUDA 版 llama.cpp（参数见 `Runtime/BUILD.md`） |
 | `Tools/serve_llama.sh` | 启动 llama-server（定版参数，环境变量可覆盖端口/模型路径） |
 | `Tools/mem_probe.py` | 整栈内存与单次调用时延探针（阶段 7 验收口径） |
-| `Tools/chat_latency_probe.py` | 流式/非流式热聊首声对比 |
+| `Tools/chat_latency_probe.py` | 流式/非流式热聊首声对比（该工具只量生成+合成，不含播放提交，更不含声学首声） |
 | `Tools/make_compare_fixtures.py` | 生成双图价格比较夹具 |
 | `Tools/make_compare_audio_fixtures.py` | 生成固定问题音频夹具（ASR 自检后落盘） |
 | `Tools/run_aieyes.sh` / `Tools/stop_aieyes.sh` | 目标板离机启动/停止（先服务端后交互服务，`setsid nohup`） |

@@ -10,6 +10,12 @@
   "models": {
     "root": "/home/mylin/Desktop/Nuo/models"
   },
+  "tts": {
+    "fixed_cache_dir": "/home/mylin/Desktop/Nuo/models/tts-fixed/xiaoxiao",
+    "fixed_voice_id": "zh-CN-XiaoxiaoNeural",
+    "target_rms_dbfs": -19.0,
+    "peak_ceiling_dbfs": -1.0
+  },
   "llm": {
     "base_url": "http://127.0.0.1:8080",
     "model": "qwen35",

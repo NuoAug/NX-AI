@@ -99,7 +99,12 @@ class PlaybackHandle:
             self._cancel()
 
     def wait(self, timeout: float | None = None) -> bool:
-        """等待播放结束（或取消）；返回是否已结束。"""
+        """等待播放结束（或取消）；返回是否已结束。
+
+        注意：返回值 **不等于** 「播完了」——``cancel()`` 之后返回 True，播放卡死
+        （一直没播完）返回 False。需要区分「用户主动取消 / 播放卡死 / 正常播完」时，
+        读句柄的 ``stop_reason``（``user_cancel`` / ``playback_stalled`` / ``""``）。
+        """
         if self._wait is None:
             return True
         return bool(self._wait(timeout))

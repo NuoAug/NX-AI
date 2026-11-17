@@ -31,6 +31,10 @@ from .. import events
 from ..chat import ChatSession
 from ..clock import CLOCK_ID, mono_ms
 from ..config import AppConfig
+from ..contract.guidance_intent import (
+    classify_guidance_action,
+    send_guidance_intent,
+)
 from ..contract.handlers import (
     cancel_result_data,
     capabilities_result_data,
@@ -114,6 +118,8 @@ _SCENE_INTENT_HINT: dict[IntentKind, str] = {
 _SCENE_KINDS: frozenset[IntentKind] = frozenset(
     {IntentKind.LOOK, IntentKind.PRICE, IntentKind.DATE, IntentKind.FIND}
 )
+# 第九章 4 固定话术：只有可信片段边界，从未播完处接着说的提示
+NOTICE_REPEAT_RESUME = "刚才那一句可能没播完整，我从这里接着说。"
 
 
 class InteractionEngine:
@@ -170,6 +176,9 @@ class InteractionEngine:
         self._closed = False
         self._utterance_t0: int | None = None
         self._utterance_end_ms: int | None = None
+        # 本回合话语 id：每回合开始递增，回合内稳定（control.intent 与播报证据共用）。
+        self._utterance_seq = 0
+        self._utterance_id = ""
         self._wake_t0: int | None = None
         self._playback_t0: int | None = None
         self._llm_thread_lock = threading.Lock()
@@ -187,6 +196,36 @@ class InteractionEngine:
         self._guidance_pending: dict[str, Any] | None = None
         self._active_request_id: str | None = None
         self._playback_priority: dict[str, Any] | None = None
+        # 最近一次「回答」播报的 run 状态（供第九章续播复用，不复制分段逻辑）。
+        # 一次回答 = 一个 run：流式分多次 _speak 时按 append 追加片段；
+        # token 隔离被取消/换问题后的旧状态，避免旧线程把新 run 的索引写脏。
+        self._answer_run_token = 0
+        self._answer_run_pieces: list[str] = []
+        self._answer_run_index = -1
+        self._answer_run_text = ""
+        # 最近一次 _ask_model 等待生成锁的耗时（ms，-1 表示还没拿到/未开始）
+        self._lock_wait_ms = -1.0
+        # 上一次视觉回答实际用过的帧：同图追问时复用，避免每问必重拍。
+        # 取消/停止/换问题后必须清掉（见 _drop_scene_frame），否则会拿旧图当新画面。
+        self._last_scene_frame: Any | None = None
+        # 最近一次比较任务（纠正时按位置释放旧帧用；None 表示没有可纠正的任务）
+        self._last_compare_task: Any | None = None
+        # “刚才那个”这类插问指向不明时，记下待回答的问题，等用户补充第一件/第二件。
+        self._compare_recall_pending: dict[str, str] | None = None
+        # 等待拍摄时“先别拍”的短回执计数：第一次带用法，之后只说“我等你”。
+        self._compare_hold_acks = 0
+        # 上一轮回答的对象与类型：纠正“不是第二个，是第一个”时区分改指代/换归属。
+        self._last_answer_kind = ""  # compare | recall | scene
+        self._last_answer_position = ""  # A | B | AB | S
+        self._last_recall_question = ""
+        # “你想重拍第一件还是第二件？”之后等待用户只回答“第一件/第二件”。
+        self._reshoot_pending: dict[str, str] | None = None
+        # 双图各位置连续失败次数：用于有界重试提示，不阻断用户退出。
+        self._compare_capture_failures: dict[tuple[str, str], int] = {}
+        # 帧对象缓存（`frame_id -> frame`，最近 8 张）：证据存储只留 id，历史图引用
+        # （`source="history"`）要按 id 回取帧对象，重拍放弃的旧帧也在这里留一份。
+        self._frame_cache: dict[str, Any] = {}
+        self._frame_cache_order: list[str] = []
 
     # ------------------------------------------------------------------
     def attach_contract(self, contract: Any | None) -> None:
@@ -383,6 +422,7 @@ class InteractionEngine:
         """同步停声：失效播报/问答代次、取消播放任务并通知播放出口取消。"""
         self._speech_gen += 1
         self._qa_gen += 1
+        self._drop_scene_frame()
         task = self._speech_task
         self._speech_task = None
         if task is not None and not task.done():
@@ -446,13 +486,35 @@ class InteractionEngine:
         kind: str,
         ref_ms: int | None = None,
         meta: dict[str, Any] | None = None,
+        answer_mode: str = "new",
+        answer_pieces: list[str] | None = None,
+        answer_offset: int = 0,
     ) -> bool:
-        """播报一段文本；返回是否完整播完（被打断/失败返回 False）。"""
+        """播报一段文本；返回是否完整播完（被打断/失败返回 False）。
+
+        ``kind="answer"`` 时按 run 记续播状态（返回值契约不变，仍是 bool）：
+
+        - ``answer_mode="new"``：新的一次回答，重置 run（pieces/索引/全文）；
+        - ``"append"``：流式同一回答的后续句，把 ``text`` 追加到 run 全文；
+        - ``"continue"``：续播已存在 run 的未播部分（``answer_pieces`` +
+          ``answer_offset`` 指定从第几段起），全文不变。
+        """
         if not (text or "").strip():
             return True
         self._speech_gen += 1
         gen = self._speech_gen
-        task = asyncio.create_task(self._speech_worker(text, gen, kind, ref_ms, meta))
+        task = asyncio.create_task(
+            self._speech_worker(
+                text,
+                gen,
+                kind,
+                ref_ms,
+                meta,
+                answer_mode=answer_mode,
+                answer_pieces=answer_pieces,
+                answer_offset=answer_offset,
+            )
+        )
         self._speech_task = task
         try:
             return await task
@@ -478,15 +540,31 @@ class InteractionEngine:
         kind: str,
         ref_ms: int | None,
         meta: dict[str, Any] | None = None,
+        *,
+        answer_mode: str = "new",
+        answer_pieces: list[str] | None = None,
+        answer_offset: int = 0,
     ) -> bool:
-        pieces = split_text(text, self.cfg.tts.max_segment_chars)
+        if answer_pieces is not None:
+            # 续播/追加：分段来自同一份 run 列表，不重复 split_text
+            pieces = list(answer_pieces)
+        else:
+            pieces = split_text(text, self.cfg.tts.max_segment_chars)
+        run_token = 0
+        start = 0
+        if kind == "answer":
+            # 第九章续播要用「可信片段位置」：run 内记分段与已播完到第几段
+            run_token = self._begin_answer_run(text, answer_mode, pieces, answer_offset)
+            if answer_mode != "new":
+                start = max(0, min(answer_offset, len(pieces)))
         prev_state = self.state
         self.state = InteractionState.SPEAKING if prev_state is not InteractionState.GREETING else prev_state
         self.frontend.set_wake_enabled(False)
         self._record("speech", "worker_start", self.now_ms() - (ref_ms or self.now_ms()), speech_kind=kind)
         played_all = True
         try:
-            for idx, piece in enumerate(pieces):
+            for idx in range(start, len(pieces)):
+                piece = pieces[idx]
                 if gen != self._speech_gen or self._closed:
                     played_all = False
                     break
@@ -509,32 +587,60 @@ class InteractionEngine:
                     start_basis=("device_write" if type(self.sink).__name__ == "AudioSink" else "estimated"),
                     meta=meta,
                 )
-                if idx == 0:
+                if idx == start:
+                    # 「本次调用里实际播出的第一段」＝开口。answer_mode="new" 时 start==0，与改前一致；
+                    # append/continue 时记的是这一次续播的开口延迟（base 仍是距用户说完的累计量）。
+                    #
+                    # `basis` 说明这是什么时刻：**软件播放提交时刻**（`sink.play()`
+                    # 返回、音频交给设备之后），不是声学首声——本机没有麦克风/扬声器
+                    # 回路采样，任何措辞或统计都不得把它当"用户听到第一声"的延迟。
+                    # 续句（`segment_offset > 0`）是同一轮回答的中途续播，与"每轮首个
+                    # 实质内容开口"不是同一个统计对象：算 P95 时只取 `segment_offset == 0`。
                     base = ref_ms if ref_ms is not None else (self._utterance_t0 or t_play)
-                    self._record("latency", "first_audio", t_play - base, speech_kind=kind)
+                    self._record(
+                        "latency",
+                        "first_audio",
+                        t_play - base,
+                        speech_kind=kind,
+                        segment_offset=start,
+                        basis="playback_submitted",
+                    )
                 self.bus.post(events.PlaybackStarted(piece_id, t_play, piece))
                 finished = await asyncio.to_thread(handle.wait, None)
+                # `wait()` 的布尔只说明「是否结束」，不说明为什么结束：用户取消时
+                # 返回 True、播放卡死时返回 False。原因由 handle 的 `stop_reason`
+                # 带出来（``playback_stalled`` / ``user_cancel`` …），证据行与
+                # `PlaybackFinished.stop_reason` 用同一个字符串，别再把两者都压成
+                # ``interrupted``——那样「卡死」和「用户主动打断」在数据上不可分。
+                reason = getattr(handle, "stop_reason", "") or ("completed" if finished else "interrupted")
+                # 已经播了多少：优先取句柄的真值（sink 会按实际播出的毫秒记
+                # ``played_ms``），取不到才回落到旧口径。被去重后页面只收到 engine
+                # 这一条终态，「已经播了多少」不能在这里被抹成 0。
+                played_ms = int(getattr(handle, "played_ms", 0) or (handle.total_ms if finished else 0))
                 self._publish_playback(
                     "completed" if finished else "cancelled",
                     kind=kind,
                     segment_index=idx,
                     generation=gen,
-                    reason_code=None if finished else "interrupted",
+                    reason_code=None if finished else reason,
                     meta=meta,
                 )
                 self.bus.post(
                     events.PlaybackFinished(
                         piece_id,
                         self.now_ms(),
-                        int(handle.total_ms if finished else 0),
+                        played_ms,
                         handle.total_ms,
                         cancelled=not finished,
                         text=piece,
+                        stop_reason=reason,
                     )
                 )
                 if not finished:
                     played_all = False
                     break
+                if kind == "answer":
+                    self._commit_answer_run_index(run_token, idx)
         finally:
             if gen == self._speech_gen and not self._closed:
                 self.frontend.set_wake_enabled(True)
@@ -553,6 +659,27 @@ class InteractionEngine:
         self._utterance_end_ms = ev.t_audio_end_ms
         text = (ev.text or "").strip()
         self._record("utterance", "final", 0, chars=len(text), text=text[:80])
+        # ASR 收尾耗时单列：t_final 是 finalize 返回时刻，t_audio_end 是 VAD 段尾。
+        # 端点等待（静音判定）不计入这一项，避免把“等静音”和“解码收尾”混成一个数。
+        self._record(
+            "asr", "final",
+            max(0, int(ev.t_final_ms) - int(ev.t_audio_end_ms)),
+            audio_ms=max(0, int(ev.t_audio_end_ms) - int(ev.t_audio_start_ms)),
+            chars=len(text),
+        )
+        samples = getattr(ev, "samples", None)
+        if samples is not None and len(samples):
+            import numpy as np
+            data = np.asarray(samples, dtype=np.float32).reshape(-1)
+            if data.size:
+                peak = float(np.max(np.abs(data)))
+                rms = float(np.sqrt(np.mean(np.square(data))))
+                self._record(
+                    "utterance", "audio", 0,
+                    duration_ms=int(round(data.size * 1000 / 16000)),
+                    peak_dbfs=round(20 * float(np.log10(max(peak, 1e-9))), 1),
+                    rms_dbfs=round(20 * float(np.log10(max(rms, 1e-9))), 1),
+                )
         if not text:
             await self._handle_empty_utterance()
             return
@@ -576,6 +703,9 @@ class InteractionEngine:
 
     async def _utterance_flow(self, text: str, *, samples: Any = None) -> None:
         gen = self._qa_gen
+        # 一回合一个 id：本回合内所有引用（control.intent、证据行）都用它，跨回合唯一。
+        self._utterance_seq += 1
+        self._utterance_id = f"u{self._utterance_seq}"
         intent = classify(text)
         self._record("intent", intent.kind.value, 0, text=intent.text[:80])
         identity = await self._verify_identity(samples)
@@ -612,10 +742,18 @@ class InteractionEngine:
                 return
             self._record("wakefree", "accept", 0, reason=decision.reason)
         self._wakefree_onset_ms = None
+        # 合同引导（control.intent）：必须先于 STOP/RESUME/REPEAT 判定，否则
+        # “暂停引导/继续引导/再说一遍引导”会被本地控制词吃掉，永远到不了主控。
+        # 否定/纠正由 classify_guidance_action 自己返回 None，这里不绕过它。
+        guidance_action = classify_guidance_action(intent.text or intent.raw)
+        if guidance_action is not None:
+            await self._do_guidance(guidance_action, intent)
+            return
+        # 全局控制先于任务层：停止/清除/开关麦/紧急不能被“好了/拍/第一件”等词吞掉。
         if intent.kind is IntentKind.CLEAR:
             await self._do_clear()
             return
-        if intent.kind is IntentKind.STOP:
+        if intent.kind is IntentKind.STOP and not self._looks_like_compare_abandon(text):
             await self._do_stop()
             return
         if intent.kind is IntentKind.MUTE:
@@ -626,11 +764,69 @@ class InteractionEngine:
             self.state = InteractionState.LISTENING
             await self._enter_listening()
             return
+        if intent.kind is IntentKind.CONTRACT:
+            # 合同/紧急（"紧急" 词表命中，但 "紧急停止" 仍走 STOP）：
+            # 设备侧动作只能由主控经 guidance 下发，本地能做到的是停播 + 说清边界。
+            if self.contract is not None:
+                self._record("contract", "no_local_action", 0, reason="device_side_only")
+            else:
+                self._record("contract", "not_linked", 0, reason="contract_disabled")
+            await self._interrupt_speech(cancel_flow=False, reason="contract")
+            self.state = InteractionState.SPEAKING
+            await self._speak(
+                "紧急停止我这边没有接到设备侧，现在只能停下播报。",
+                kind="contract_unavailable",
+            )
+            await self._enter_listening()
+            return
+
+        task = self._last_compare_task
+        if (task is not None and not getattr(task, "finished", False)
+                and any(task.frames.get(p) is not None for p in ("A", "B"))
+                and self._looks_like_compare_repair(text)):
+            await self._do_reshoot(text, gen)
+            return
+        if self._reshoot_pending is not None and await self._handle_reshoot_pending(text, gen):
+            return
+        if self._compare_waiting():
+            # 整句意愿仲裁：疑问/不确定/否定/引用优先于“好了/拍/准备”等词。
+            action = self._compare_waiting_action(text)
+            if action == "status":
+                await self._do_compare_status()
+                return
+            if action == "clarify":
+                await self._clarify_compare_waiting(text)
+                return
+            if action == "hold":
+                self._record("compare", "hold", 0, task=task.task_id, text=text[:40])
+                await self._ack_compare_hold()
+                return
+            if action == "recall":
+                if await self._handle_compare_followup(text, gen, intent):
+                    return
+                self._record("compare", "recall_unavailable", 0, task=task.task_id)
+                self.state = InteractionState.SPEAKING
+                await self._speak(
+                    "这一问我还没有可用的画面，等拍好再问我。",
+                    kind="compare_recall_none",
+                )
+                await self._enter_listening()
+                return
+            if action == "ready":
+                self._record("compare", "resume_ready", 0, task=task.task_id, text=text[:40])
+                await self._do_resume(gen)
+                return
+        if self._last_compare_task is not None and await self._handle_compare_followup(text, gen, intent):
+            return
+        if self._looks_like_status_question(text):
+            # 没有比较任务/比较已结束时，也直接按实际状态回答，不交模型猜。
+            await self._do_compare_status()
+            return
         if intent.kind is IntentKind.BACKCHANNEL:
             await self._do_backchannel()
             return
         if intent.kind is IntentKind.CORRECT:
-            await self._do_correct()
+            await self._do_correct(intent)
             return
         if intent.kind is IntentKind.REPEAT:
             await self._do_repeat(intent)
@@ -655,14 +851,73 @@ class InteractionEngine:
             await self._do_scene(intent, gen)
             return
         if intent.kind not in (IntentKind.CHAT,):
-            # 双图比较/合同能力尚未接入（阶段 4/6）：诚实说明，不编造画面
+            # 其余未接入的分类：诚实说明，不编造画面
             self.state = InteractionState.SPEAKING
             await self._speak("这个能力我还没接上，先聊点别的吧。", kind="unsupported")
             await self._enter_listening()
             return
+        if self._looks_like_garbled_utterance(text):
+            self._record("chat", "unclear", 0, text=text[:40])
+            self.state = InteractionState.SPEAKING
+            await self._speak("我没听清，能再说一遍吗？", kind="t02_retry")
+            await self._enter_listening()
+            return
         await self._do_chat(text, gen)
 
+    async def _do_guidance(self, action: str, intent: Intent) -> None:
+        """引导控制意图：交给主控（合同 §ControlIntent），本地只播回执。
+
+        回执措辞与超时口径由 contract.guidance_intent 统一给出，这里不重写；
+        未接合同时如实说明没连上，不假装已经执行；不新增任何移动/通行/空间动作。
+        """
+        if self.contract is None:
+            self._record(
+                "contract", "not_linked", 0,
+                reason="contract_disabled", action=action, utterance_id=self._utterance_id,
+            )
+            self.state = InteractionState.SPEAKING
+            await self._speak(
+                "引导功能我这边没有接到主控，现在没法开始或暂停。",
+                kind="control_unavailable",
+            )
+            await self._enter_listening()
+            return
+        outcome = await send_guidance_intent(
+            self.contract,
+            action=action,
+            utterance_id=self._utterance_id,
+            final_transcript=intent.raw,
+        )
+        self._record(
+            "control", "intent", 0,
+            action=action, accepted=outcome.accepted,
+            operation_state=outcome.operation_state, reason_code=outcome.reason_code,
+            utterance_id=self._utterance_id,
+        )
+        self.state = InteractionState.SPEAKING
+        await self._speak(outcome.speech, kind="control")
+        await self._enter_listening()
+
     async def _do_chat(self, text: str, gen: int) -> None:
+        # 新问题开始：清掉上一轮答案的 run，旧残片不得串进本轮（第九章）
+        self._reset_answer_run()
+        if self.image_tasks is not None and self._looks_like_compare_repair(text):
+            # 「重拍第二件 / 换一个再看」这类是**对已有双图任务的返工**：必须进重拍
+            # 路径，不能掉进文本问答、也不能被"已有帧就不重拍"的复用逻辑绕过
+            # （功能说明 L171/L267：明确要求重拍优先进入重拍路径）。
+            await self._do_reshoot(text, gen)
+            return
+        if self.scene is not None and self._looks_like_fresh_capture_request(text):
+            # 明确要求重拍/换新画面、但没有双图任务在跟：走单图取新图，
+            # 不能被文本问答吞掉（上游词表里没有"重拍"，这里兜住）。
+            self._record("chat", "fresh_capture_request", 0, text=text[:40])
+            await self._do_scene(Intent(kind=IntentKind.LOOK, text=text, raw=text), gen)
+            return
+        if self.scene is not None and self._looks_like_visual_followup(text):
+            # 「现在呢 / 再看看」是视觉追问：走场景链路（复用上一帧），不进纯文本问答
+            self._record("chat", "visual_followup", 0, text=text[:40])
+            await self._do_scene(Intent(kind=IntentKind.LOOK, text=text, raw=text), gen)
+            return
         if self._stream_chat_available():
             await self._do_chat_streaming(text, gen)
             return
@@ -673,15 +928,30 @@ class InteractionEngine:
         answer = None
         attempts = 0
         while attempts <= timers.t11_retry_max:
+            if gen != self._qa_gen:
+                # 代次已失效（用户插话/换问题）：不再为过时的一轮发起重试
+                self._record("llm", "retry_abandoned", self.now_ms() - t_start, attempt=attempts)
+                return
             attempts += 1
+            self._lock_wait_ms = -1.0
             try:
                 answer = await asyncio.wait_for(
-                    asyncio.to_thread(self._ask_model, text),
+                    asyncio.to_thread(self._ask_model, text, record=False),
                     timeout=timers.t11_generate_ms / 1000,
                 )
+                self._record("llm", "lock_wait", self._lock_wait_ms, attempt=attempts)
                 break
             except asyncio.TimeoutError:
-                self._record("t11", "timeout", self.now_ms() - t_start, attempt=attempts)
+                self._record(
+                    "t11",
+                    "timeout",
+                    self.now_ms() - t_start,
+                    attempt=attempts,
+                    lock_wait=self._lock_wait_ms,
+                )
+                if gen != self._qa_gen:
+                    self._record("llm", "retry_abandoned", self.now_ms() - t_start, attempt=attempts)
+                    return
                 if attempts <= timers.t11_retry_max:
                     await asyncio.sleep(timers.t11_retry_delay_ms / 1000)
             except Exception as exc:  # noqa: BLE001 - 模型异常降级到固定话术
@@ -714,6 +984,22 @@ class InteractionEngine:
             played=played,
             text=(answer.text or "")[:120],
         )
+        if played and gen == self._qa_gen:
+            # 历史只记"用户真正听到的回答"：提交晚于播报，且本轮播报完整、未被插话。
+            # 生成完成即提交会让 TTS 失败/播报中被打断/整轮取消的答案也留在历史里，
+            # 用户从未听全却成了下一问的上下文（超时被放弃那条路径由 record=False 挡住）。
+            self.chat.record(
+                text, answer.text, images=answer.images, t_ms=answer.t_end_ms
+            )
+        else:
+            self._record(
+                "answer",
+                "not_committed",
+                0,
+                played=played,
+                stale=gen != self._qa_gen,
+                chars=len(answer.text or ""),
+            )
         await self._after_answer_listen()
 
     def _stream_chat_available(self) -> bool:
@@ -754,6 +1040,28 @@ class InteractionEngine:
         parts: list[str] = []
         buf = ""
         spoken = False
+        played_all = True
+        play_failed = False
+        stream_pieces: list[str] = []
+
+        async def _speak_phrase(phrase: str) -> bool:
+            """流式逐句播报；同一回答的多句累积到同一个 answer run（第九章续播）。"""
+            seg = split_text(phrase, self.cfg.tts.max_segment_chars)
+            if not seg:
+                return True
+            offset = len(stream_pieces)
+            first = offset == 0
+            stream_pieces.extend(seg)
+            self.state = InteractionState.SPEAKING
+            return await self._speak(
+                phrase,
+                kind="answer",
+                ref_ms=ref_ms if not spoken else None,
+                answer_mode="new" if first else "append",
+                answer_pieces=stream_pieces,
+                answer_offset=offset,
+            )
+
         try:
             while True:
                 try:
@@ -787,15 +1095,33 @@ class InteractionEngine:
                         )
                         return
                     self.state = InteractionState.SPEAKING
-                    await self._speak(
-                        piece, kind="answer", ref_ms=ref_ms if not spoken else None
-                    )
+                    ok = await _speak_phrase(piece)
+                    played_all = played_all and bool(ok)
                     spoken = True
-            if buf.strip() and gen == self._qa_gen:
-                self.state = InteractionState.SPEAKING
-                await self._speak(
-                    buf, kind="answer", ref_ms=ref_ms if not spoken else None
-                )
+                    if not ok:
+                        # 片段失败即停播后续句子（与非流式 worker 内 break 对齐）
+                        play_failed = True
+                        stop.set()
+                        break
+                if play_failed:
+                    break
+            if play_failed and gen == self._qa_gen:
+                # 播报中断时，「已生成但还没交给 _speak」的尾部也要登记进 run：
+                # 流式一次性只把已开播的句子放进 run，用户之后说「接着说完」就取不到尾句，
+                # 与非流式（一次性 split_text 出全部段）不一致。这里补登记，不改 index。
+                tail_parts = [buf]
+                buf = ""
+                while True:
+                    try:
+                        tail_kind, tail_payload = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if tail_kind == "delta" and tail_payload:
+                        tail_parts.append(str(tail_payload))
+                self._extend_answer_run_tail("".join(tail_parts))
+            if buf.strip() and gen == self._qa_gen and not play_failed:
+                ok = await _speak_phrase(buf)
+                played_all = played_all and bool(ok)
                 spoken = True
         except asyncio.CancelledError:
             stop.set()
@@ -814,12 +1140,24 @@ class InteractionEngine:
             await self._after_recovery_listen()
             return
         self._record("llm", "done", llm_ms, chars=len(full), streamed=True)
-        self.chat.record(text, full)
+        if played_all and gen == self._qa_gen:
+            # 与非流式同一规则：只有每一段都播完、本轮未被插话，才把完整回答写进历史
+            self.chat.record(text, full)
+        else:
+            self._record(
+                "answer",
+                "not_committed",
+                0,
+                played=played_all,
+                stale=gen != self._qa_gen,
+                chars=len(full),
+                streamed=True,
+            )
         self._record(
             "answer",
             "spoken",
             self.now_ms() - t_start,
-            played=spoken,
+            played=played_all,
             text=full[:120],
         )
         await self._after_answer_listen()
@@ -835,10 +1173,37 @@ class InteractionEngine:
         t_start = self.now_ms()
         question = intent.text or intent.raw
         hint = _SCENE_INTENT_HINT.get(intent.kind)
+        source = self._scene_source()
+        overview = self._is_scene_overview(question)
+        reuse = self._last_scene_frame if self._should_reuse_scene_frame(question) else None
+        reused_from = "scene" if reuse is not None else ""
+        if reuse is None:
+            # 上一轮/已释放位置留下的帧：按**历史图引用**回答（功能说明 L171/L267：
+            # 已有可访问且适用照片时复用；`record_capture` 对 `source="history"`
+            # 不扣次数、不启动 T08）。没有历史帧才老实取新图。
+            history_frame = self._history_scene_frame(question)
+            if history_frame is not None:
+                reuse = history_frame
+                reused_from = "history"
+                source = self._scene_source(history=True)
+        if reuse is None and not overview and self.image_tasks.target_budget_exhausted(source=source):
+            # 单目标 3 次额度用尽：不再发取图请求，直接说明（功能说明 L360）
+            self._record("scene", "budget_blocked", 0, source=source)
+            self.state = InteractionState.SPEAKING
+            await self._speak(
+                "这个目标这一轮已经看了三次，换个东西或者让我从头来。",
+                kind="capture_budget",
+            )
+            await self._enter_listening()
+            return
         answer: Any = None
         try:
+            kwargs: dict[str, Any] = {"intent_hint": hint}
+            if reuse is not None:
+                # 只有确实要复用时才传 frame=，避免给不支持的 scene 实现多塞参数
+                kwargs["frame"] = reuse
             answer = await asyncio.wait_for(
-                asyncio.to_thread(scene.answer, question, intent_hint=hint),
+                asyncio.to_thread(scene.answer, question, **kwargs),
                 timeout=timers.t11_generate_ms / 1000,
             )
         except asyncio.TimeoutError:
@@ -858,17 +1223,39 @@ class InteractionEngine:
             await self._speak("我没看清画面，你再让我看一眼？", kind="scene_fallback")
             await self._after_recovery_listen()
             return
+        self._last_scene_frame = getattr(self.scene, "last_frame", None)
+        if reuse is None and not overview:
+            # 真正发过取图请求才登记额度；复用缓存帧与整景观察不计数
+            group = self.image_tasks.current_target_group(source=source)
+            snapshot = self.image_tasks.record_capture(
+                None, group, str(getattr(answer, "frame_id", "") or "")
+            )
+            self._record("scene", "capture_count", 0, **snapshot)
+        elif reused_from == "history":
+            # 历史图引用：仍留下证据引用，但不扣次数、不起 T08
+            group = self.image_tasks.current_target_group(source="history")
+            snapshot = self.image_tasks.record_capture(
+                None, group, str(getattr(answer, "frame_id", "") or "")
+            )
+            self._record("scene", "history_ref", 0, **snapshot)
         self._record(
             "scene",
             "answer",
             scene_ms,
             intent=str(getattr(answer, "intent", "") or ""),
             frame_id=str(getattr(answer, "frame_id", "") or ""),
+            reused=reuse is not None,
+            reused_from=reused_from,
+            source=source,
+            position=self._evidence_position(reuse),
             degraded=",".join(getattr(answer, "degraded", ()) or ()),
             sources=",".join(str(getattr(tag, "kind", tag)) for tag in (getattr(answer, "source_tags", ()) or ())),
             chars=len(text),
         )
         self.state = InteractionState.SPEAKING
+        self._last_answer_kind = "scene"
+        self._last_answer_position = self._evidence_position(reuse)
+        self._last_recall_question = question
         played = await self._speak(text, kind="answer", ref_ms=ev_reference(self, t_start))
         self._record(
             "answer",
@@ -882,10 +1269,569 @@ class InteractionEngine:
     # ------------------------------------------------------------------
     # 阶段 4：双图比较与被打断任务的恢复
     # ------------------------------------------------------------------
-    def _scene_source(self) -> str:
+    def _scene_source(self, *, history: bool = False) -> str:
+        """取图来源标签。`history=True` 表示"用已有照片回答"，不占取图额度。"""
+        if history:
+            return "history"
         provider = getattr(self.scene, "provider", None)
         name = type(provider).__name__.lower() if provider is not None else ""
         return "file" if "file" in name else "camera"
+
+    # 用户明确要求「重新看一张」时不得复用上一帧
+    _SCENE_FRESH_WORDS = ("拍一下", "拍照", "新的", "重新看", "再来一张", "换一个", "换个")
+    # 整景观察类提问：每次都要新画面，且不占单目标 3 次额度
+    _FRESH_LOOK_RE = re.compile(
+        r"(眼前|前面|周围|身边|四周|画面里|视野里|看到(?:什么|啥)|看见(?:什么|啥)|看看(?:有|是|前面|周围|眼前))"
+    )
+    # 时间性视觉追问：物体/场景可能已经变化，必须重新取图
+    _TEMPORAL_LOOK_WORDS = ("现在呢", "再看看", "变了没")
+    # 「现在呢 / 再看看」这类是视觉追问，不该掉进纯文本聊天
+    _VISUAL_FOLLOWUP_WORDS = ("现在呢", "再看看", "还有呢", "变了没", "现在多少")
+
+    def _is_scene_overview(self, question: str) -> bool:
+        """整景观察（眼前/前面/周围有什么）：取新图且不占单目标额度。"""
+        text = question or ""
+        if any(word in text for word in self._SCENE_FRESH_WORDS):
+            return False
+        return bool(self._FRESH_LOOK_RE.search(text))
+
+    def _needs_fresh_scene_frame(self, question: str) -> bool:
+        text = question or ""
+        return self._is_scene_overview(text) or any(
+            word in text for word in self._TEMPORAL_LOOK_WORDS
+        )
+
+    def _should_reuse_scene_frame(self, question: str) -> bool:
+        """同图追问：只有明确指向当前画面的细节问题才复用上一帧。"""
+        if self._last_scene_frame is None:
+            return False
+        if self._needs_fresh_scene_frame(question):
+            return False
+        return not any(word in (question or "") for word in self._SCENE_FRESH_WORDS)
+
+    def _looks_like_visual_followup(self, text: str) -> bool:
+        return any(word in (text or "") for word in self._VISUAL_FOLLOWUP_WORDS)
+
+    _COMPARE_READY_RE = re.compile(
+        r"(继续|接着|接续|继|好了|放好|摆好|换好|换过|另一件|另一个|第二个放|"
+        r"放上去|可以看|来看|看这个|看第二|准备|可以|拍|开始|第一件|第二件|第[一二]张)"
+    )
+    #: 等待拍摄时用户最自然的短确认。只在整句就是“好/好的/行/可以”时命中，
+    #: 避免“好看”“不好”这类句子被当成准备好了。
+    _COMPARE_CONFIRM_RE = re.compile(
+        r"^(?:嗯+|啊+|哦+|噢+)?\s*[，,]?\s*(?:好|好的|好呀|好嘞|行|可以|没问题|ok|OK)"
+        r"[吧了呀啊\s。！!，,]*$"
+    )
+    #: 明确表示“还没准备好/先别拍”。等待阶段命中后保持等待，不取图、不推进。
+    _COMPARE_HOLD_RE = re.compile(
+        r"(等一下|等一等|稍等|先等|还没|没好|没换好|没摆好|没放好|"
+        r"先别|别拍|不要拍|不用拍|先不|还没摆正|先别急|不要继续|别继续)"
+    )
+    _COMPARE_PAUSE_RE = re.compile(
+        r"(先放着|先放一放|先不比了|待会儿再比|一会儿再比|稍后再比|"
+        r"先停一下|聊点别的|说点别的)"
+    )
+    _COMPARE_ABANDON_RE = re.compile(
+        r"(算了|不比了|不比较了|别比了|取消(?:这个)?比较|结束(?:这个)?比较|"
+        r"不比这个了|不用比了)"
+    )
+    _COMPARE_REFINE_RE = re.compile(
+        r"(?:只|就|也|再|还|单独|重新).{0,4}(?:比|比较|看|算|加|考虑)"
+        r"|(?:价格|容量|大小|颜色|日期|保质期|优惠|重量|尺寸).{0,4}(?:也|都|一起|算|加|比)"
+        r"|(?:哪个更|哪个比较|更划算|更便宜|更贵)"
+        r"|(?:它们|刚才那两).{0,8}(?:区别|差异|不一样|哪个|怎么样)"
+    )
+    _COMPARE_RECALL_RE = re.compile(
+        r"(?:刚才|第一件|第二件|第一个|第二个|那两个|它们).{0,10}"
+        r"(?:多少钱|价格|是什么|叫什么|什么样子|哪个)"
+    )
+    #: “不是第二个，是第一个 / 刚才说反了，左边才是第一件”：只改 A/B 归属，
+    #: 不重拍、不丢其他证据。
+    _COMPARE_SWAP_RE = re.compile(
+        r"(?:说反|反了|搞反|弄反|左右反|对调|换过来|换个位置)"
+        r"|(?:不是|并不是)(?:第一个|第二个|第一件|第二件|左边|右边|左面|右面)"
+        r"[^。！？]{0,6}(?:是|应该是|才是)(?:第一个|第二个|第一件|第二件|左边|右边|左面|右面)"
+    )
+    #: 点到具体是哪一件（插问 / 澄清回答共用）。
+    _POSITION_A_RE = re.compile(r"第一件|第一个|第一张|左边|左面|前者")
+    _POSITION_B_RE = re.compile(r"第二件|第二个|第二张|右边|右面|后者")
+
+    def _compare_waiting(self) -> bool:
+        task = self._last_compare_task
+        return (task is not None and not getattr(task, "finished", False)
+                and getattr(task, "pause_reason", "") in (
+                    "waiting_first", "waiting_second", "user_pause",
+                    "capture_failed_first", "capture_failed_second",
+                ))
+
+    def _looks_like_compare_ready(self, text: str) -> bool:
+        t = text or ""
+        if re.search(
+            r"(还没|没好|等一下|稍等|先等|别拍|不要拍|不用拍|先不|不好|不行|不拍|不可以|不能|"
+            r"不要继续|别继续|不用继续|先别)",
+            t,
+        ) and not re.search(r"(好了|放好了|可以了|继续拍|开始拍|换好了|摆好了)", t):
+            return False
+        return bool(self._COMPARE_CONFIRM_RE.match(t) or self._COMPARE_READY_RE.search(t))
+
+    def _looks_like_compare_hold(self, text: str) -> bool:
+        t = text or ""
+        # “先不比价格，看日期”是改比较项，不是“先别拍”这种保持等待。
+        if re.search(r"(?:不比|不看|不算|去掉|删掉)(?:价格|日期|颜色|容量|大小|重量)", t):
+            return False
+        return bool(self._COMPARE_HOLD_RE.search(t))
+
+    def _looks_like_compare_pause(self, text: str) -> bool:
+        return bool(self._COMPARE_PAUSE_RE.search(text or ""))
+
+    def _looks_like_compare_abandon(self, text: str) -> bool:
+        t = text or ""
+        if re.search(r"(不比价格|不比颜色|不比日期|不比大小|不比容量|不比重)", t):
+            return False
+        return bool(self._COMPARE_ABANDON_RE.search(t))
+
+    def _looks_like_compare_refine(self, text: str) -> bool:
+        t = text or ""
+        if self._looks_like_compare_abandon(t):
+            return False
+        if re.search(r"(?:不比|不看|别比|不要比|不用比|不算|去掉|删掉)(?:价格|日期|颜色|容量|大小|重量)", t):
+            # “不比价格了，看日期”是改比较项，不是放弃整个任务。
+            return True
+        if re.search(r"(不比|别比|不要比|先不比|不用比)", t):
+            return False
+        return bool(self._COMPARE_REFINE_RE.search(t))
+
+    def _looks_like_compare_recall(self, text: str) -> bool:
+        return bool(self._COMPARE_RECALL_RE.search(text or ""))
+
+    def _looks_like_compare_swap(self, text: str) -> bool:
+        return bool(self._COMPARE_SWAP_RE.search(text or ""))
+
+    # -- 等待拍摄时的整句意愿仲裁 -------------------------------------
+    # 不靠继续加白名单：先去掉引用内容，再按分句取“最后有效意愿”，
+    # 疑问/不确定/过去完成态优先于“好了/拍/准备”等词。
+    _QUOTED_RE = re.compile(r"[“\"『「][^”\"』」]{0,40}[”\"』」]")
+    _STATUS_QUESTION_RE = re.compile(
+        r"(现在到哪|到哪一步|进行到哪|你在等什么|在等什么|还要等多久|还要多久|"
+        r"现在什么状态|什么进度|进度怎么样|现在在做什么|你在做什么)"
+    )
+    _UNCERTAIN_WAITING_RE = re.compile(
+        r"(不知道|不确定|没想好|不清楚|说不准|准备好了没有|好了没有|"
+        r"可以了吗|好了吗|行了吗|能拍了吗|可以拍了吗)"
+    )
+    _PAST_CAPTURE_RE = re.compile(r"(?:已经|刚才|刚刚).{0,4}(?:拍|拍好|拍了)")
+    _READY_CLAUSE_RE = re.compile(
+        r"(?:好了|好呀|好嘞|可以了|放好了|摆好了|换好了|准备好了|放上去|"
+        r"现在是另一件|来看|看这个|可以看|可以拍|拍吧|开始吧|继续|接着)"
+    )
+    _HOLD_CLAUSE_RE = re.compile(
+        r"(等一下|等一等|稍等|先等|还没|没好|没换好|没摆好|没放好|先别|"
+        r"别拍|不要拍|不用拍|不可以拍|不能拍|不好|不行|不可以|不能|先不|先别急|不要继续|别继续|"
+        r"不用继续|不是现在|不是让你|没有让你|没让你|没说(?:过)?(?:继续|拍)|我是说再等)"
+    )
+    _NOISY_READY_RE = re.compile(r"^(?:嗯+|啊+)?继")
+    _PREMATURE_COMPARE_RE = re.compile(r"(?:哪个更|哪个贵|哪个便宜|有什么区别|差在哪|哪个划算)")
+    _SHORT_READY_RE = re.compile(
+        r"^(?:嗯+|啊+|哦+)?\s*(?:好|好的|好呀|好嘞|行|可以|没问题|ok|OK)"
+        r"[吧了呀啊\s。！!]*$"
+    )
+
+    def _without_quoted(self, text: str) -> str:
+        return self._QUOTED_RE.sub(" ", text or "")
+
+    def _correction_target_position(self, text: str) -> str | None:
+        """“是第一个/才是第一件/改成第二个”指向的目标位置。"""
+        t = self._without_quoted(text)
+        m = re.search(
+            r"(?:是|应该是|才是|其实是|改成|换成)\s*(?:第一个|第一件|第一张|左边|左面)",
+            t,
+        )
+        if m:
+            return "A"
+        m = re.search(
+            r"(?:是|应该是|才是|其实是|改成|换成)\s*(?:第二个|第二件|第二张|右边|右面)",
+            t,
+        )
+        if m:
+            return "B"
+        return None
+
+    def _looks_like_status_question(self, text: str) -> bool:
+        return bool(self._STATUS_QUESTION_RE.search(self._without_quoted(text)))
+
+    def _compare_clause_kind(self, clause: str) -> str:
+        c = (clause or "").strip()
+        if not c:
+            return "other"
+        if self._HOLD_CLAUSE_RE.search(c):
+            return "hold"
+        if c.endswith(("?", "？")) or re.search(r"(?:吗|呢|么)\s*$", c):
+            return "question"
+        if self._SHORT_READY_RE.match(c) or self._READY_CLAUSE_RE.search(c) or self._NOISY_READY_RE.match(c):
+            return "ready"
+        return "other"
+
+    def _compare_waiting_action(self, text: str) -> str:
+        """等待拍摄时这句话最终要做什么：status/recall/clarify/hold/ready/none。"""
+        t = self._without_quoted(text).strip()
+        if not t:
+            return "none"
+        if self._looks_like_status_question(t):
+            return "status"
+        if self._looks_like_compare_recall(t):
+            return "recall"
+        if self._PREMATURE_COMPARE_RE.search(t):
+            # “这两个哪个贵”是在问阶段，不是准备完成；先说明还在等哪一件。
+            return "status"
+        if self._PAST_CAPTURE_RE.search(t):
+            return "clarify"
+        if self._UNCERTAIN_WAITING_RE.search(t):
+            return "clarify"
+        clauses = [c for c in re.split(r"[，。！？!?；;、…~\n]+", t) if c.strip()]
+        kinds = [self._compare_clause_kind(c) for c in clauses]
+        relevant = [kind for kind in kinds if kind in ("ready", "hold", "question")]
+        if not relevant:
+            return "none"
+        last = relevant[-1]
+        return "clarify" if last == "question" else last
+
+    async def _ack_compare_hold(self) -> None:
+        """“先别拍”的短回执：第一次带用法，之后只说“我等你”，避免重复长篇提示。"""
+        prompt = "好，我等你。准备好了说“好了”。" if self._compare_hold_acks == 0 else "好，我等你。"
+        self._compare_hold_acks += 1
+        self.state = InteractionState.SPEAKING
+        await self._speak(prompt, kind="compare_hold")
+        await self._enter_listening()
+
+    async def _clarify_compare_waiting(self, text: str) -> None:
+        """不确定时只问一个必要问题，不猜、不取图。"""
+        task = self._last_compare_task
+        reason = getattr(task, "pause_reason", "") if task is not None else ""
+        self._record(
+            "compare", "clarify", 0,
+            task=getattr(task, "task_id", ""), reason=reason, text=text[:40],
+        )
+        self.state = InteractionState.SPEAKING
+        if reason == "waiting_second":
+            prompt = "你是说第二件已经放好了吗？放好了说“好了”，还没好就说“等一下”。"
+        elif reason == "user_pause":
+            prompt = "你是说可以继续了吗？可以就说“继续”或“好了”。"
+        else:
+            prompt = "你是说第一件已经放好了吗？放好了说“好了”，还没好就说“等一下”。"
+        await self._speak(prompt, kind="compare_clarify")
+        await self._enter_listening()
+
+    async def _do_compare_status(self) -> None:
+        """用实际任务状态回答“你在等什么/到哪一步了”，不交模型猜。"""
+        task = self._last_compare_task
+        if task is None:
+            self._record("status", "query", 0, scope="listen")
+            self.state = InteractionState.SPEAKING
+            await self._speak("我在听你说。要比较两件东西，就说“对比这两个”。", kind="status")
+            await self._enter_listening()
+            return
+        reason = str(getattr(task, "pause_reason", "") or "")
+        if getattr(task, "finished", False):
+            prompt = "刚才的比较已经结束。你可以说“继续”看之前的图，或者重新说“对比这两个”。"
+        elif reason == "waiting_first":
+            prompt = "我在等第一件。把第一件放到镜头前，放好说“好了”。"
+        elif reason == "waiting_second":
+            prompt = "第一件已经拍到了，我在等第二件。放好说“好了”。"
+        elif reason == "user_pause":
+            prompt = "比较先暂停着。已经拍到的还保留，说“继续”或“好了”接着来。"
+        elif reason == "capture_failed_second":
+            prompt = "第二件上次没拍到，第一件还保留着。准备好后说“好了”，或者“重拍第二件”。"
+        elif reason == "capture_failed_first":
+            prompt = "第一件上次没拍到。准备好后说“好了”再试。"
+        else:
+            prompt = "我正在看画面，请稍等。"
+        self._record(
+            "compare", "status", 0,
+            task=task.task_id, reason=reason or str(getattr(task, "state", "")),
+        )
+        self.state = InteractionState.SPEAKING
+        await self._speak(prompt, kind="compare_status")
+        await self._enter_listening()
+
+    def _compare_recent(self, task: Any, window_ms: int = 180_000) -> bool:
+        """未完成任务随时可继续；已完成任务只在短时间内还当作“刚才那两件”。"""
+        if not getattr(task, "finished", False):
+            return True
+        finished = int(getattr(task, "finished_ms", 0) or 0)
+        return finished > 0 and (self.now_ms() - finished) <= window_ms
+
+    def _merge_compare_question(self, task: Any, text: str) -> str:
+        """把补充要求并进比较问题；只追加，不覆盖已有点到的维度。"""
+        base = str(getattr(task, "question", "") or "").strip()
+        addition = (text or "").strip()
+        if not addition or addition in base:
+            return base or "比较一下这两样东西"
+        merged = f"{base}；{addition}" if base else addition
+        return merged[:160]
+
+    def _compare_focus_text(self, text: str) -> str:
+        """补充比较项后的短回执：只说确实点到的东西，不复述整句。"""
+        t = text or ""
+        parts: list[str] = []
+        if re.search(r"价格|价钱|多少钱|贵|便宜|划算", t):
+            parts.append("价格")
+        if re.search(r"日期|保质期|到期|新鲜", t):
+            parts.append("日期")
+        if re.search(r"颜色|什么色", t):
+            parts.append("颜色")
+        if re.search(r"容量|大小|重量|尺寸|规格", t):
+            parts.append("规格")
+        if parts:
+            return "好，这次重点看" + "、".join(parts) + "。"
+        return "好，我按你说的补充来比。"
+
+    def _looks_like_garbled_utterance(self, text: str) -> bool:
+        """明显夹杂口头填充/重复、又没有明确意图的短句，先请用户重说。"""
+        t = (text or "").strip()
+        if not t:
+            return False
+        if re.search(
+            r"(有什么|是什么|多少钱|价格|保质期|日期|在哪|哪里|看看|读|念|找|"
+            r"对比|比较|重拍|停止|继续|清空|静音|关麦|开麦)", t
+        ):
+            return False
+        if re.search(r"对不对", t) and not re.search(r"不是|搞错|弄错|我说", t):
+            return True
+        return len(t) <= 8 and bool(re.search(r"(嗯|呃|啊|哦|那个|这个)", t))
+
+    def _looks_like_fresh_capture_request(self, text: str) -> bool:
+        """用户是否明确要一张**新画面**（重拍/换一个），而不是追问当前这帧。"""
+        question = text or ""
+        return any(word in question for word in self._RESHOOT_WORDS + self._SWAP_WORDS)
+
+    def _drop_scene_frame(self) -> None:
+        """取消/停止/换问题后丢掉缓存的画面，避免拿旧帧回答新问题。"""
+        self._last_scene_frame = None
+        self._frame_cache.clear()
+        self._frame_cache_order.clear()
+        reset = getattr(self.scene, "reset_last_frame", None)
+        if callable(reset):
+            reset()
+
+    # 明确要求重拍：必须自重拍路径进入取图，不能被"已有帧"复用绕过（L209/L267）
+    _RESHOOT_WORDS = (
+        "重拍", "重新拍", "再拍一张", "再拍一次", "补拍", "重新照", "重新看那张",
+        "重来一次", "重来一遍", "重新来一次", "重新来一遍",
+    )
+    # 换物：双图两件都换掉（L213：只替换某一件时走 _correct_position 的单位置释放）
+    _SWAP_WORDS = ("换一个", "换个", "换一件", "换一物", "换新的")
+
+    def _remember_frame(self, frame: Any) -> None:
+        """记住帧对象（证据存储只留 id，历史图引用与重拍放弃的旧帧都要按 id 回取）。"""
+        if frame is None:
+            return
+        frame_id = str(getattr(frame, "frame_id", "") or "")
+        if not frame_id:
+            return
+        self._frame_cache[frame_id] = frame
+        if frame_id in self._frame_cache_order:
+            self._frame_cache_order.remove(frame_id)
+        self._frame_cache_order.append(frame_id)
+        while len(self._frame_cache_order) > 8:
+            self._frame_cache.pop(self._frame_cache_order.pop(0), None)
+
+    def _history_scene_frame(self, question: str) -> Any:
+        """上一次任务/已释放位置留下的帧：拿来做历史图引用（不扣额度，L171/L267）。
+
+        `latest_evidence()` 只返回**未释放**的当前证据；已释放位置（重拍/换物/任务
+        结束时留下的旧照片）只在 `history_index()` 里，行上带 `released`。
+        """
+        if self._needs_fresh_scene_frame(question):
+            return None
+        if any(word in (question or "") for word in self._SCENE_FRESH_WORDS):
+            return None
+        latest = getattr(self.image_tasks, "latest_evidence", None)
+        if callable(latest):
+            try:
+                evidence = latest(None)
+            except TypeError:  # pragma: no cover - 兼容无参实现
+                evidence = latest()
+            if isinstance(evidence, dict):
+                frame = self._frame_cache.get(str(evidence.get("frame_id") or ""))
+                if frame is not None:
+                    return frame
+        history = getattr(self.image_tasks, "history_index", None)
+        if callable(history):
+            try:
+                rows = history(limit=8)
+            except TypeError:  # pragma: no cover - 兼容无参实现
+                rows = history()
+            for row in rows or ():
+                if not isinstance(row, dict) or not row.get("released"):
+                    continue
+                frame = self._frame_cache.get(str(row.get("frame_id") or ""))
+                if frame is not None:
+                    return frame
+        # 回落：用最近登记过的帧（取消/停止已清空缓存，不会拿被丢弃的旧图）
+        for frame_id in reversed(self._frame_cache_order):
+            frame = self._frame_cache.get(frame_id)
+            if frame is not None:
+                return frame
+        return None
+
+    def _evidence_position(self, frame: Any) -> str:
+        """这一问用的是 A 还是 B（双图归属）；单目标记 S。"""
+        if frame is None:
+            return "S"
+        task = self._last_compare_task
+        if task is not None:
+            for position in ("A", "B"):
+                if task.frames.get(position) is frame:
+                    return position
+        frame_id = str(getattr(frame, "frame_id", "") or "")
+        latest = getattr(self.image_tasks, "latest_evidence", None)
+        if frame_id and callable(latest):
+            try:
+                evidence = latest(None)
+            except TypeError:  # pragma: no cover - 兼容无参实现
+                evidence = None
+            if isinstance(evidence, dict) and str(evidence.get("frame_id") or "") == frame_id:
+                return str(evidence.get("position") or "S")
+        return "S"
+
+    def _looks_like_compare_repair(self, text: str) -> bool:
+        """这句话是不是对**已有双图任务**的返工请求（重拍 / 换物）。"""
+        question = text or ""
+        if re.search(r"(?:不要|别|不用|没有让你|没让你).{0,6}(?:重拍|重新拍|再拍|补拍|重来|换一个|换个|换一物)", question):
+            return False
+        wants_reshoot = any(word in question for word in self._RESHOOT_WORDS)
+        wants_swap = any(word in question for word in self._SWAP_WORDS)
+        if not (wants_reshoot or wants_swap):
+            return False
+        return self._open_compare_task() is not None or self._last_compare_task is not None
+
+    def _open_compare_task(self) -> Any:
+        task = self._last_compare_task
+        if task is not None and not getattr(task, "finished", False):
+            return task
+        resume = getattr(self.image_tasks, "resume_target", None)
+        if callable(resume):
+            return resume()
+        return None
+
+    def _max_position_captures(self) -> int:
+        return int(getattr(self.image_tasks, "max_captures_per_position", 3) or 3)
+
+    async def _do_reshoot(self, text: str, gen: int) -> None:
+        """重拍/换物：先让旧照片退出该位置，再按**原额度**重取，另一位置不动。
+
+        功能说明 L209 / L213：明确重拍后旧照片不再作为该位置的当前证据，重拍失败
+        也不能默默回退旧图；另一位置保留；位置次数不因重拍/换组重置（额度记在
+        `CompareTask.position_captures`，`release_position` 不动它）。
+        """
+        question = text or ""
+        task = self._open_compare_task()
+        finished_task = task is None and self._last_compare_task is not None
+        if task is None and self._last_compare_task is None:
+            self._record("compare", "reshoot_none", 0, text=question[:40])
+            self.state = InteractionState.SPEAKING
+            await self._speak("现在没有要重拍的图，先让我看一眼再说。", kind="reshoot_none")
+            await self._enter_listening()
+            return
+        if task is not None and not finished_task and self._looks_like_compare_refine(question):
+            # “重拍第一件，然后只比较价格”：返工和补充要求在同一句里，一起生效。
+            task.question = self._merge_compare_question(task, question)
+            self._record("compare", "refine_in_repair", 0, task=task.task_id, question=task.question[:80])
+        swap = any(word in question for word in self._SWAP_WORDS) and not any(
+            word in question for word in self._RESHOOT_WORDS
+        )
+        if finished_task:
+            old = self._last_compare_task
+            reusable = (
+                not swap
+                and old is not None
+                and any(old.frames.get(p) is not None for p in ("A", "B"))
+            )
+            if reusable:
+                # 已结束的一轮：用户明确点到某一件时，只重拍那一件，另一件沿用；
+                # 没点到哪件就复用两帧先问清位置（不重拍、不丢证据）。
+                task = self._reopen_compare(old, question or old.question)
+                if task is None:
+                    self._record("compare", "capacity_blocked", 0)
+                    self.state = InteractionState.SPEAKING
+                    await self._speak(
+                        "现在有两个没看完的看图任务，要先结束一个才能比新的。",
+                        kind="capacity",
+                    )
+                    await self._enter_listening()
+                    return
+                self._record(
+                    "compare", "reshoot_reuse_pair", 0,
+                    task=task.task_id, old=old.task_id,
+                    position=self._correct_position(question) or "",
+                )
+            else:
+                # 换物（两件都换）或旧轮没有可用帧：开新一轮。
+                self._record("compare", "reshoot_new_round", 0, task=old.task_id)
+                try:
+                    task = self.image_tasks.open_compare(question or "重拍")
+                except CapacityError:
+                    self._record("compare", "capacity_blocked", 0)
+                    self.state = InteractionState.SPEAKING
+                    await self._speak("现在有两个没看完的看图任务，要先结束一个才能比新的。", kind="capacity")
+                    await self._enter_listening()
+                    return
+                self._last_compare_task = task
+                await self._run_compare(task, gen, first_ready=True)
+                return
+        positions: list[str]
+        if swap:
+            positions = [position for position in ("A", "B") if task.frames.get(position) is not None]
+        else:
+            position = self._correct_position(question)
+            if position is None:
+                held = [p for p in ("A", "B") if task.frames.get(p) is not None]
+                position = held[0] if len(held) == 1 else None
+            if position is None:
+                self._record("compare", "reshoot_clarify", 0, task=task.task_id)
+                self._reshoot_pending = {"task_id": task.task_id, "question": question}
+                self.state = InteractionState.SPEAKING
+                await self._speak("你想重拍第一件还是第二件？", kind="reshoot_clarify")
+                await self._enter_listening()
+                return
+            positions = [position]
+        if not positions:
+            self._record("compare", "reshoot_none", 0, task=task.task_id)
+            self.state = InteractionState.SPEAKING
+            await self._speak("现在没有要重拍的图，先让我看一眼再说。", kind="reshoot_none")
+            await self._enter_listening()
+            return
+        limit = self._max_position_captures()
+        exhausted = [
+            position
+            for position in positions
+            if int(task.position_captures.get(position, 0) or 0) >= limit
+        ]
+        if exhausted:
+            # 额度用尽不先 release：否则用户会看到"准备重拍→又没了"的白跑流程
+            self._record(
+                "compare", "budget_blocked", 0,
+                task=task.task_id, position=",".join(exhausted), limit=limit,
+            )
+            self.state = InteractionState.SPEAKING
+            await self._speak(
+                "这个位置的取图次数已经用完了，换个东西或者让我从头来。",
+                kind="capture_budget",
+            )
+            await self._enter_listening()
+            return
+        for position in positions:
+            previous = task.frames.get(position)
+            if previous is not None:
+                self._remember_frame(previous)  # 放弃的旧帧留作历史引用，不冒充当前证据
+            self.image_tasks.release_position(task, position)
+            self._record(
+                "compare", "reshoot", 0,
+                task=task.task_id, position=position, swap=swap,
+                remaining=max(0, limit - int(task.position_captures.get(position, 0) or 0)),
+            )
+        self._last_compare_task = task
+        await self._run_compare(task, gen, first_ready=True)
 
     async def _acquire_frame(self, purpose: str = "vqa") -> Any:
         """按 T09 预算从场景提供者取一帧（相机/文件）。"""
@@ -899,6 +1845,10 @@ class InteractionEngine:
 
     async def _do_compare(self, intent: Intent, gen: int) -> None:
         question = intent.text or intent.raw or "比较一下这两样东西"
+        self._compare_recall_pending = None
+        self._compare_hold_acks = 0
+        self._reshoot_pending = None
+        self._compare_capture_failures.clear()
         try:
             task = self.image_tasks.open_compare(question)
         except CapacityError:
@@ -908,9 +1858,11 @@ class InteractionEngine:
             await self._enter_listening()
             return
         self._record("compare", "start", 0, task=task.task_id, question=question[:80])
+        self._last_compare_task = task
         await self._run_compare(task, gen)
 
     async def _do_resume(self, gen: int) -> None:
+        self._compare_hold_acks = 0
         if self.identity is not None and not self.identity.access_ok():
             self._record("materials", "resume_denied", 0, reason="identity_unverified")
             self.state = InteractionState.SPEAKING
@@ -924,15 +1876,30 @@ class InteractionEngine:
             await self._enter_listening()
             return
         self._record("compare", "resume", 0, task=task.task_id, state=task.state)
-        await self._run_compare(task, gen)
+        await self._run_compare(task, gen, first_ready=True)
 
-    async def _run_compare(self, task: Any, gen: int) -> None:
+    async def _run_compare(self, task: Any, gen: int, *, first_ready: bool = False) -> None:
         timers = self.cfg.timers
         self.state = InteractionState.THINKING
         self.frontend.set_listening(True)
         t_start = self.now_ms()
-        source = self._scene_source()
+        # 两个位置都已有帧 = 这一轮只用历史图（恢复/翻面追问），不占取图额度
+        both_cached = all(task.frames.get(position) is not None for position in ("A", "B"))
+        started_without_frames = not any(task.frames.get(p) is not None for p in ("A", "B"))
+        if started_without_frames and not first_ready:
+            # 新比较任务先让用户准备第一件，不能对着当前场景直接拍一张
+            self.image_tasks.mark(task, "paused", reason="waiting_first")
+            self._record("compare", "wait_first", 0, task=task.task_id)
+            self.state = InteractionState.SPEAKING
+            await self._speak(
+                "先把第一件东西放到镜头前，准备好了说“好”“继续”或“拍”。",
+                kind="compare_wait",
+            )
+            await self._enter_listening()
+            return
+        source = self._scene_source(history=both_cached)
         answer: Any = None
+        capture_position = ""
         try:
             self.image_tasks.mark(task, "capturing")
             for position in ("A", "B"):
@@ -943,7 +1910,10 @@ class InteractionEngine:
                     group = self.image_tasks.new_group(task, position=position, source=source)
                 frame = task.frames.get(position)
                 if frame is None:
+                    capture_position = position
                     frame = await self._acquire_frame("vqa")
+                    capture_position = ""
+                    self._remember_frame(frame)
                     frame_id = str(getattr(frame, "frame_id", "") or "")
                     self._record(
                         "compare", "capture", self.now_ms() - t_start,
@@ -952,17 +1922,39 @@ class InteractionEngine:
                     snapshot = self.image_tasks.record_capture(task, group, frame_id)
                     self._record("compare", "capture_count", 0, **snapshot)
                     task.frames[position] = frame
+                    self._compare_capture_failures.pop((task.task_id, position), None)
+                    if (position == "A" and started_without_frames
+                            and task.frames.get("B") is None):
+                        # 第一件已拍：等用户把第二件放到镜头前并说“继续”，
+                        # 不能在同一场景里连拍两张冒充双图比较。
+                        self.image_tasks.mark(task, "paused", reason="waiting_second")
+                        self._record("compare", "wait_second", self.now_ms() - t_start,
+                                     task=task.task_id)
+                        self.state = InteractionState.SPEAKING
+                        await self._speak(
+                            "第一件我看到了。请把第二件放到镜头前，说“好”或“继续”再拍。",
+                            kind="compare_wait",
+                        )
+                        await self._enter_listening()
+                        return
+            capture_position = ""
             self.image_tasks.mark(task, "analyzing")
             answer = await asyncio.wait_for(
                 asyncio.to_thread(self.scene.compare, task.frames["A"], task.frames["B"], task.question),
                 timeout=timers.t11_generate_ms / 1000,
             )
         except asyncio.CancelledError:
-            if not task.finished:
+            # 只把真正被打断的采集中状态标成 barge_in；已经在等用户准备
+            # （waiting_first/waiting_second）或已被用户明确暂停的任务保留原阶段，
+            # 否则插话后“好了/继续”就接不上原来的等待。
+            if not task.finished and task.state in ("open", "capturing", "analyzing"):
                 self.image_tasks.mark(task, "paused", reason="barge_in")
             self._record("compare", "paused", self.now_ms() - t_start, task=task.task_id)
             raise
         except asyncio.TimeoutError:
+            if capture_position:
+                await self._handle_compare_capture_failure(task, capture_position, None)
+                return
             self._record("t11", "timeout", self.now_ms() - t_start, scope="compare")
             if not task.finished:
                 self.image_tasks.mark(task, "paused", reason="timeout")
@@ -971,6 +1963,9 @@ class InteractionEngine:
             await self._after_recovery_listen()
             return
         except Exception as exc:  # noqa: BLE001 - 视觉异常降级到固定话术
+            if capture_position:
+                await self._handle_compare_capture_failure(task, capture_position, exc)
+                return
             self._record("compare", "error", self.now_ms() - t_start, error=repr(exc)[:200])
             if not task.finished:
                 self.image_tasks.close(task, reason="error")
@@ -1013,9 +2008,402 @@ class InteractionEngine:
             snapshot=task.snapshot(),
         )
         self.state = InteractionState.SPEAKING
+        self._last_answer_kind = "compare"
+        self._last_answer_position = "AB"
         played = await self._speak(text, kind="answer", ref_ms=ev_reference(self, t_start))
         self._record("answer", "spoken", self.now_ms() - t_start, played=played, text=text[:120])
         await self._after_answer_listen()
+
+    async def _handle_compare_capture_failure(
+        self, task: Any, position: str, exc: Exception | None
+    ) -> None:
+        """拍摄失败：保留另一件，给一个当前证据支持的调整动作，且有界提示。"""
+        label = "第一件" if position == "A" else "第二件"
+        reason, guidance = self._capture_failure_guidance(exc)
+        key = (task.task_id, position)
+        count = self._compare_capture_failures.get(key, 0) + 1
+        self._compare_capture_failures[key] = count
+        if count >= 2:
+            next_step = "已经两次没拍到了。你可以换一件、稍后再试，或者说不比了。"
+        elif position == "B" and task.frames.get("A") is not None:
+            next_step = "第一件还保留着，只需要重新看第二件。准备好后说“好了”或“重拍第二件”。"
+        else:
+            next_step = "准备好后说“好了”再试。"
+        message = f"{label}这次没拍到，{reason}。{guidance}{next_step}"
+        reason_code = "capture_failed_first" if position == "A" else "capture_failed_second"
+        if not task.finished:
+            self.image_tasks.mark(task, "paused", reason=reason_code)
+        self._record(
+            "compare", "capture_failed", 0,
+            task=task.task_id, position=position, reason=reason_code,
+            detail=(repr(exc)[:200] if exc is not None else "timeout"), count=count,
+        )
+        self.state = InteractionState.SPEAKING
+        await self._speak(message, kind="compare_capture_failed")
+        await self._enter_listening()
+
+    @staticmethod
+    def _capture_failure_guidance(exc: Exception | None) -> tuple[str, str]:
+        """把质量标签映射成“一个当前能执行的调整动作”，不猜方向/距离。"""
+        if exc is None:
+            return "相机这次没在预想时间内出图", "先确认镜头没有被挡住，或者把物品放稳。"
+        # 延迟导入：scene 包会拉起视觉相机模块，Windows 无 fcntl 时不应影响引擎导入。
+        try:
+            from ..scene.errors import FrameAcquisitionError, FrameQualityError
+        except Exception:  # noqa: BLE001 - 导入失败按一般取图失败处理
+            FrameAcquisitionError = FrameQualityError = ()  # type: ignore[assignment]
+        if FrameQualityError and isinstance(exc, FrameQualityError):
+            report = getattr(exc, "report", None)
+            labels = tuple(getattr(report, "labels", ()) or ())
+            if "dark" in labels:
+                return "画面太暗", "把物品移到亮一点的地方，或让镜头别背光。"
+            if "bright" in labels:
+                return "画面太亮", "避开强光或反光，稍微换个角度。"
+            if "blurry" in labels:
+                return "画面有点糊", "把物品放稳，镜头和物品都别晃。"
+            if "too_small" in labels:
+                return "画面里目标太小", "把物品靠近镜头一些，占满画面中间。"
+            if "too_large" in labels:
+                return "画面里目标太大", "把物品稍微拿远一点，让整体都在画面里。"
+            return "画面还不够清楚", "把物品放到画面中间，放稳一点。"
+        if FrameAcquisitionError and isinstance(exc, FrameAcquisitionError):
+            return "没有取得画面", "先确认镜头没有被挡住，再试一次。"
+        return "这次没取得画面", "先确认镜头没有被挡住，再试一次。"
+
+    # -- 双图任务的自然后续：准备/保持、补充、插问、纠正、暂停与放弃 --------
+    async def _handle_compare_followup(
+        self, text: str, gen: int, intent: Intent | None = None
+    ) -> bool:
+        """双图任务的后续话。只有确实属于当前任务时才消费，否则交回正常路由。
+
+        “继续/好了/嗯”由当前阶段决定含义：等待拍摄时才是“准备好了”，
+        其它时候仍走普通恢复/附和，不做全局同义词映射。
+        """
+        task = self._last_compare_task
+        if task is None:
+            return False
+        kind = getattr(intent, "kind", None)
+        abandon = self._looks_like_compare_abandon(text)
+        if kind in (
+            IntentKind.STOP,
+            IntentKind.CLEAR,
+            IntentKind.MUTE,
+            IntentKind.UNMUTE,
+            IntentKind.CONTRACT,
+        ) and not abandon:
+            return False
+
+        # 插问指向不明（“刚才那个”）：上一轮已问“第一件还是第二件”，这里接短回答。
+        pending = self._compare_recall_pending
+        if pending is not None and pending.get("task_id") == getattr(task, "task_id", ""):
+            position = self._spoken_position(text)
+            if position is not None and len(text.strip()) <= 8:
+                self._compare_recall_pending = None
+                return await self._answer_compare_recall(
+                    pending.get("question") or text, position, task, gen
+                )
+            self._compare_recall_pending = None
+
+        if abandon:
+            await self._abandon_compare(task, text)
+            return True
+
+        if self._compare_waiting() and self._looks_like_compare_hold(text):
+            self._record("compare", "hold", 0, task=task.task_id, text=text[:40])
+            await self._enter_listening()
+            return True
+
+        if self._looks_like_compare_swap(text):
+            await self._correct_compare_order(text, gen, task)
+            return True
+
+        if self._looks_like_compare_recall(text):
+            position = self._spoken_position(text)
+            if position is not None:
+                return await self._answer_compare_recall(text, position, task, gen)
+            held = [p for p in ("A", "B") if task.frames.get(p) is not None]
+            if len(held) == 1:
+                return await self._answer_compare_recall(text, held[0], task, gen)
+            if held:
+                self._compare_recall_pending = {"task_id": task.task_id, "question": text}
+                self._record("compare", "recall_clarify", 0, task=task.task_id, text=text[:40])
+                self.state = InteractionState.SPEAKING
+                await self._speak("你是问第一件还是第二件？", kind="compare_recall_clarify")
+                await self._enter_listening()
+                return True
+            return False
+
+        if self._looks_like_compare_pause(text):
+            await self._pause_compare(task, text)
+            return True
+
+        if self._looks_like_compare_refine(text):
+            await self._refine_compare(text, gen, task)
+            return True
+        return False
+
+    def _spoken_position(self, text: str) -> str | None:
+        t = text or ""
+        has_a = bool(self._POSITION_A_RE.search(t))
+        has_b = bool(self._POSITION_B_RE.search(t))
+        if has_a and not has_b:
+            return "A"
+        if has_b and not has_a:
+            return "B"
+        return None
+
+    def _recall_intent_hint(self, question: str) -> str:
+        if re.search(r"多少钱|价格|价钱|几块|售价|打折", question or ""):
+            return "price"
+        if re.search(r"保质期|生产日期|到期|有效期|日期", question or ""):
+            return "date"
+        return "describe"
+
+    async def _answer_compare_recall(
+        self, question: str, position: str, task: Any, gen: int
+    ) -> bool:
+        """中途插问：用已拍到的这一件回答，任务阶段保持不变。"""
+        if self.scene is None:
+            return False
+        label = "第一件" if position == "A" else "第二件"
+        frame = task.frames.get(position)
+        if frame is None:
+            self._record("compare", "recall_no_frame", 0, task=task.task_id, position=position)
+            self.state = InteractionState.SPEAKING
+            await self._speak(f"{label}还没有图，等拍好我再告诉你。", kind="compare_recall_none")
+            await self._enter_listening()
+            return True
+        timers = self.cfg.timers
+        self.state = InteractionState.THINKING
+        self.frontend.set_listening(True)
+        t_start = self.now_ms()
+        answer: Any = None
+        try:
+            answer = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.scene.answer,
+                    question,
+                    frame=frame,
+                    intent_hint=self._recall_intent_hint(question),
+                ),
+                timeout=timers.t11_generate_ms / 1000,
+            )
+        except asyncio.TimeoutError:
+            self._record("t11", "timeout", self.now_ms() - t_start, scope="compare_recall")
+        except Exception as exc:  # noqa: BLE001 - 插问失败不打断比较任务
+            log.warning("compare recall failed: %r", exc)
+            self._record(
+                "compare", "recall_error", self.now_ms() - t_start, error=repr(exc)[:200]
+            )
+        elapsed = self.now_ms() - t_start
+        if gen != self._qa_gen:
+            self._record("compare", "recall_stale", elapsed, task=task.task_id)
+            return True
+        text = (getattr(answer, "text", "") or "").strip() if answer is not None else ""
+        if not text:
+            self._record("compare", "recall_failed", elapsed, task=task.task_id)
+            self.state = InteractionState.SPEAKING
+            await self._speak("这一问我没看清，等下再问我。", kind="compare_recall_fallback")
+            await self._enter_listening()
+            return True
+        self._record(
+            "compare", "recall", elapsed,
+            task=task.task_id, position=position,
+            frame_id=str(getattr(answer, "frame_id", "") or ""),
+            chars=len(text), text=text[:80],
+        )
+        self.state = InteractionState.SPEAKING
+        self._last_answer_kind = "recall"
+        self._last_answer_position = position
+        self._last_recall_question = question
+        await self._speak(text, kind="answer", ref_ms=ev_reference(self, t_start))
+        await self._after_answer_listen()
+        return True
+
+    async def _pause_compare(self, task: Any, text: str) -> None:
+        """暂停（不是结束）：保留任务与证据，之后说“继续/好了”还能接上。"""
+        if not getattr(task, "finished", False):
+            try:
+                self.image_tasks.mark(task, "paused", reason="user_pause")
+            except Exception:  # noqa: BLE001 - 暂停失败不影响回执
+                log.warning("pause compare failed", exc_info=True)
+        self._record("compare", "pause", 0, task=task.task_id, text=text[:40])
+        self.state = InteractionState.SPEAKING
+        await self._speak("好，先放着。想聊别的直接说。", kind="compare_pause")
+        await self._enter_listening()
+
+    async def _abandon_compare(self, task: Any, text: str) -> None:
+        """结束比较：释放任务，后续“继续”不再复活旧比较结果。"""
+        if not getattr(task, "finished", False):
+            try:
+                self.image_tasks.close(task, reason="user_abandon")
+            except Exception:  # noqa: BLE001 - 关闭失败仍要给出明确结束回执
+                log.warning("abandon compare failed", exc_info=True)
+        self._record("compare", "abandon", 0, task=task.task_id, text=text[:40])
+        self._last_compare_task = None
+        self._compare_recall_pending = None
+        self._reshoot_pending = None
+        self._compare_capture_failures.clear()
+        self.state = InteractionState.SPEAKING
+        await self._speak("好，不比了。", kind="compare_abandon")
+        await self._after_answer_listen()
+
+    def _reopen_compare(self, old: Any, question: str) -> Any | None:
+        """用一个已完成任务的有效帧开新一轮（复用证据，不刷新位置额度）。"""
+        try:
+            task = self.image_tasks.open_compare(question)
+        except CapacityError:
+            return None
+        for position in ("A", "B"):
+            frame = old.frames.get(position)
+            if frame is not None:
+                task.frames[position] = frame
+        task.position_captures.update(dict(getattr(old, "position_captures", {}) or {}))
+        self._last_compare_task = task
+        self._record(
+            "compare", "reopen", 0,
+            old=old.task_id, new=task.task_id, copied=len(task.frames),
+        )
+        return task
+
+    def _swap_compare_frames(self, task: Any) -> bool:
+        """只交换 A/B 归属；帧对象、额度与其他证据都不动。"""
+        a = task.frames.get("A")
+        b = task.frames.get("B")
+        if a is None or b is None:
+            return False
+        task.frames["A"], task.frames["B"] = b, a
+        if task.group_a is not None and task.group_b is not None:
+            task.group_a.image_ids, task.group_b.image_ids = (
+                task.group_b.image_ids, task.group_a.image_ids
+            )
+        if getattr(task, "a_frame_id", "") or getattr(task, "b_frame_id", ""):
+            task.a_frame_id, task.b_frame_id = task.b_frame_id, task.a_frame_id
+        return True
+
+    async def _correct_compare_order(self, text: str, gen: int, task: Any) -> None:
+        """纠正：先看上一轮问的是什么，再决定改指代、换归属还是先澄清。"""
+        target = self._correction_target_position(text) or self._spoken_position(text)
+        explicit_swap = bool(
+            re.search(r"(?:说反|反了|搞反|弄反|左右反|对调|换过来|换个位置)", text or "")
+        )
+        # 上一轮问的是某一件：这是改指代，不是无条件交换 A/B。
+        if (self._last_answer_kind == "recall"
+                and self._last_answer_position in ("A", "B")
+                and target is not None):
+            question = self._last_recall_question or "这一件是什么"
+            if target == self._last_answer_position:
+                self._record(
+                    "compare", "reference_same", 0,
+                    task=task.task_id, position=target, text=text[:40],
+                )
+            else:
+                self._record(
+                    "compare", "reference_corrected", 0,
+                    task=task.task_id, from_position=self._last_answer_position,
+                    to_position=target, text=text[:40],
+                )
+            await self._answer_compare_recall(question, target, task, gen)
+            return
+        if not explicit_swap and self._last_answer_kind != "compare" and target is not None:
+            # 没有上一轮比较归属证据：先问一句，不无条件交换。
+            self._record("compare", "swap_clarify", 0, task=task.task_id, text=text[:40])
+            self.state = InteractionState.SPEAKING
+            await self._speak(
+                "你是说刚才问的对象说错了，还是要把第一件和第二件对调？",
+                kind="compare_swap_clarify",
+            )
+            await self._enter_listening()
+            return
+        if not self._compare_recent(task):
+            self._record("compare", "swap_stale", 0, task=task.task_id)
+            self.state = InteractionState.SPEAKING
+            await self._speak("那两张图已经隔了一会儿了，重新拍两件我再比较。", kind="compare_swap_stale")
+            await self._enter_listening()
+            return
+        if not all(task.frames.get(p) is not None for p in ("A", "B")):
+            self._record("compare", "swap_incomplete", 0, task=task.task_id, text=text[:40])
+            self.state = InteractionState.SPEAKING
+            await self._speak(
+                "好，我记下了。等两件都拍好，我按你说的把第一件和第二件对调。",
+                kind="compare_swap_ack",
+            )
+            await self._enter_listening()
+            return
+        if getattr(task, "finished", False):
+            task = self._reopen_compare(task, task.question)
+            if task is None:
+                self._record("compare", "capacity_blocked", 0)
+                self.state = InteractionState.SPEAKING
+                await self._speak("现在有两个没看完的看图任务，要先结束一个才能比新的。", kind="capacity")
+                await self._enter_listening()
+                return
+        self._swap_compare_frames(task)
+        self._record("compare", "swap", 0, task=task.task_id, text=text[:40])
+        await self._run_compare(task, gen, first_ready=True)
+
+    async def _handle_reshoot_pending(self, text: str, gen: int) -> bool:
+        """答“你想重拍哪一件？”：只接受位置/纠正，不把疑问当成选择。"""
+        pending = self._reshoot_pending
+        task = self._last_compare_task
+        if pending is None or task is None or pending.get("task_id") != task.task_id:
+            self._reshoot_pending = None
+            return False
+        if self._looks_like_compare_abandon(text):
+            self._reshoot_pending = None
+            return False
+        if self._looks_like_compare_recall(text):
+            # 用户先插问：先回答，重拍待选保留，下一轮再说哪一件。
+            return False
+        target = self._correction_target_position(text) or self._spoken_position(text)
+        if target is None:
+            if self._looks_like_compare_hold(text):
+                self._record("compare", "reshoot_pending_hold", 0, task=task.task_id)
+                self.state = InteractionState.SPEAKING
+                await self._speak("好，你想好了再说第一件还是第二件。", kind="reshoot_clarify_hold")
+                await self._enter_listening()
+                return True
+            self._reshoot_pending = None
+            return False
+        self._reshoot_pending = None
+        label = "第一件" if target == "A" else "第二件"
+        self._record(
+            "compare", "reshoot_pending_answer", 0,
+            task=task.task_id, position=target, text=text[:40],
+        )
+        await self._do_reshoot(f"重拍{label}", gen)
+        return True
+
+    async def _refine_compare(self, text: str, gen: int, task: Any) -> None:
+        """补充/调整比较项：复用已拍到的帧，缺第二件时只更新要求并继续等。"""
+        question = self._merge_compare_question(task, text)
+        finished = bool(getattr(task, "finished", False))
+        if finished and not self._compare_recent(task):
+            # 旧任务不复活：按新的比较要求处理，先请用户准备第一件。
+            self._record("compare", "refine_new_round", 0, task=task.task_id)
+            await self._do_compare(Intent(IntentKind.COMPARE, question, text), gen)
+            return
+        both = all(task.frames.get(p) is not None for p in ("A", "B"))
+        if finished:
+            task = self._reopen_compare(task, question)
+            if task is None:
+                self._record("compare", "capacity_blocked", 0)
+                self.state = InteractionState.SPEAKING
+                await self._speak("现在有两个没看完的看图任务，要先结束一个才能比新的。", kind="capacity")
+                await self._enter_listening()
+                return
+            self._record("compare", "refine", 0, task=task.task_id, question=question[:80])
+            await self._run_compare(task, gen, first_ready=True)
+            return
+        task.question = question
+        if both:
+            self._record("compare", "refine", 0, task=task.task_id, question=question[:80])
+            await self._run_compare(task, gen, first_ready=True)
+            return
+        self._record("compare", "refine_wait", 0, task=task.task_id, question=question[:80])
+        self.state = InteractionState.SPEAKING
+        await self._speak(self._compare_focus_text(text), kind="compare_refine_ack")
+        await self._enter_listening()
 
     # ------------------------------------------------------------------
     # 阶段 5：身份核验、免唤醒（话题窗口）与资料清除
@@ -1093,8 +2481,13 @@ class InteractionEngine:
         turns = len(self.chat.turns)
         self.chat.reset()
         cleared = self.image_tasks.clear_all()
+        self._last_compare_task = None
+        self._compare_recall_pending = None
+        self._reshoot_pending = None
+        self._compare_capture_failures.clear()
         self._exit_wakefree("cleared")
         self._silence_now()
+        self._drop_scene_frame()
         try:
             self.tts.clear_cache()
         except Exception:  # noqa: BLE001 - 清缓存失败不影响本轮清除结论
@@ -1322,12 +2715,22 @@ class InteractionEngine:
         if supersedes:
             self._guidance_seen.pop(str(supersedes), None)
         priority = str(data.get("priority") or "information")
-        text = str(data.get("text") or "").strip()
+        raw_text = str(data.get("text") or "").strip()
+        # 停步提示统一说“停下”：主控只发单字“停”时，播报端补成两字，避免单音节听不清。
+        text = "停下。" if re.fullmatch(r"停[。！!，,；;：:\s]*", raw_text) else raw_text
         if not text:
             self._record("guidance", "empty", 0, event_id=event_id)
             return
         payload = {"source_event_id": event_id, "priority": priority, "text": text, "state_id": data.get("state_id")}
-        self._record("guidance", "event", 0, event_id=event_id, priority=priority, chars=len(text))
+        self._record(
+            "guidance",
+            "event",
+            0,
+            event_id=event_id,
+            priority=priority,
+            chars=len(text),
+            text_rewritten=bool(raw_text and text != raw_text),
+        )
         if priority == "emergency":
             await self._preempt_for_guidance(payload)
         elif self.state in (InteractionState.IDLE, InteractionState.LISTENING) and not self.sink.is_playing:
@@ -1371,9 +2774,23 @@ class InteractionEngine:
         self._record("guidance", "recovered", 0, preempted=prev_state.value)
         await self._enter_listening()
 
-    def _ask_model(self, text: str) -> Any:
-        with self._llm_thread_lock:
-            return self.chat.ask(text)
+    def _ask_model(self, text: str, *, record: bool = True) -> Any:
+        """线程内调用：先在本次生成预算内拿生成锁，拿不到就不再发真请求。
+
+        被放弃的旧线程仍会算完（它拿的是 ``record=False``）；若它还没释放锁，
+        本次重试线程只等待一个预算就放弃，避免排队时间超过用户耐心、
+        也避免再白算一次模型调用。
+        """
+        budget = max(0.001, self.cfg.timers.t11_generate_ms / 1000)
+        t_lock = mono_ms()
+        got = self._llm_thread_lock.acquire(timeout=budget)
+        self._lock_wait_ms = mono_ms() - t_lock
+        if not got:
+            return None
+        try:
+            return self.chat.ask(text, record=record)
+        finally:
+            self._llm_thread_lock.release()
 
     async def _after_answer_listen(self) -> None:
         """T17：答完后继续倾听 10s，无话则回待机。"""
@@ -1435,8 +2852,49 @@ class InteractionEngine:
         self._record("utterance", "backchannel", 0)
         await self._enter_listening()
 
-    async def _do_correct(self) -> None:
-        """纠正（不是这个/我说的是…）：阶段 2 先确认收到并重新倾听，语义纠正阶段 3+ 接入。"""
+    # 纠正句里的位置词 → 比较任务位置（只认左右/第几，不猜语义）
+    _CORRECT_POSITIONS = (
+        ("左边", "A"),
+        ("左面", "A"),
+        ("第一", "A"),
+        ("右边", "B"),
+        ("右面", "B"),
+        ("第二", "B"),
+    )
+
+    def _correct_position(self, text: str) -> str | None:
+        for word, pos in self._CORRECT_POSITIONS:
+            if word in (text or ""):
+                return pos
+        return None
+
+    async def _do_correct(self, intent: "Intent | None" = None) -> None:
+        """纠正（不是这个/我说的是右边那件）：确认收到，并按位置重取那一件。
+
+        归属映射（哪件算 A/B）需要比较任务持有 A/B 标签，引擎当前没有该状态，
+        这里只做"按位置释放该位置旧帧，让下一轮重取"，不假装已经改完归属。
+        """
+        text = (getattr(intent, "text", "") or getattr(intent, "raw", "") or "") if intent else ""
+        pos = self._correct_position(text)
+        released: str | None = None
+        task = getattr(self, "_last_compare_task", None)
+        if pos is not None and task is not None:
+            group = task.group_a if pos == "A" else task.group_b
+            has_evidence = task.frames.get(pos) is not None or group is not None
+            if has_evidence:
+                try:
+                    self.image_tasks.release_position(task, pos)
+                    released = pos
+                except Exception:  # noqa: BLE001 - 释放失败不影响确认收到
+                    log.warning("release_position failed on correct", exc_info=True)
+        self._record(
+            "correct",
+            "applied" if released else "ack_only",
+            0,
+            position=pos or "",
+            released=released or "",
+            text=text[:40],
+        )
         self.state = InteractionState.SPEAKING
         await self._speak("好的，你说。", kind="correct_ack")
         await self._enter_listening()
@@ -1457,6 +2915,9 @@ class InteractionEngine:
     async def _do_stop(self) -> None:
         t0 = self.now_ms()
         metrics = await self._interrupt_speech(cancel_flow=False, reason="stop")
+        self._drop_scene_frame()
+        self._compare_recall_pending = None
+        self._reshoot_pending = None
         self._record("stop", "silenced", self.now_ms() - t0, **metrics)
         self.state = InteractionState.LISTENING
         self.frontend.set_listening(True)
@@ -1465,10 +2926,91 @@ class InteractionEngine:
         self._after(self.cfg.timers.t18_post_stop_listen_ms, self._on_stop_listen_timeout)
         self._record("t18", "listen", 0)
 
+    def _begin_answer_run(
+        self,
+        text: str,
+        mode: str,
+        pieces: list[str],
+        offset: int,
+    ) -> int:
+        """开始/接续一次回答的 run，返回该 run 的 token。
+
+        ``mode``：``new`` 新回答（重置）；``append`` 流式同一回答的后续句
+        （追加全文、分段列表由调用方累积）；``continue`` 续播既有 run 的未播部分。
+        """
+        if mode == "new":
+            self._answer_run_token += 1
+            self._answer_run_pieces = list(pieces)
+            self._answer_run_index = -1
+            self._answer_run_text = text
+        else:
+            self._answer_run_pieces = list(pieces)
+            self._answer_run_index = max(-1, min(offset - 1, len(pieces) - 1))
+            if mode == "append":
+                self._answer_run_text += text
+        return self._answer_run_token
+
+    def _commit_answer_run_index(self, token: int, idx: int) -> None:
+        """推进「已播完到第几段」；token 不符说明 run 已被新回答/取消替换。"""
+        if token != self._answer_run_token:
+            return
+        self._answer_run_index = idx
+
+    def _extend_answer_run_tail(self, text: str) -> None:
+        """把「已生成但还没开播」的尾部登记进当前 run（不推进已播位置）。
+
+        流式播报被打断时，后续句子还没交给 ``_speak``，run 里只有已开播的分段；
+        不补登记的话「接着说完」取不到尾句。``index`` 不动，尾部天然是未播部分。
+        """
+        extra = (text or "").strip()
+        if not extra:
+            return
+        pieces = split_text(extra, self.cfg.tts.max_segment_chars)
+        if not pieces:
+            return
+        self._answer_run_pieces.extend(pieces)
+        self._answer_run_text += extra
+
+    def _reset_answer_run(self) -> None:
+        """新问题开始前清空 run，避免旧答案残片串到新问题（第九章）。"""
+        self._answer_run_token += 1
+        self._answer_run_pieces = []
+        self._answer_run_index = -1
+        self._answer_run_text = ""
+
+    def _unplayed_answer_text(self) -> str:
+        """第九章 4：只有可信片段边界时，从没播完的那一段开头继续。"""
+        pieces = self._answer_run_pieces
+        if not pieces:
+            return ""
+        rest = pieces[self._answer_run_index + 1 :]
+        return "".join(rest)
+
     async def _do_repeat(self, intent: Intent) -> None:
-        last = self.chat.turns[-1].assistant if self.chat.turns else ""
+        remainder = self._unplayed_answer_text()
         self.state = InteractionState.SPEAKING
-        await self._speak(last or "刚才没有可重复的内容。", kind="repeat")
+        if remainder:
+            offset = self._answer_run_index + 1
+            self._record("repeat", "resume_unplayed", 0, chars=len(remainder), offset=offset)
+            played_notice = await self._speak(NOTICE_REPEAT_RESUME, kind="repeat_notice")
+            if not played_notice:
+                # 提示被取消/打断：用户已经在说话了，不能再接着往下播
+                self._record("repeat", "resume_aborted", 0, reason="notice_interrupted")
+                await self._after_answer_listen()
+                return
+            await self._speak(
+                remainder,
+                kind="answer",
+                answer_mode="continue",
+                answer_pieces=self._answer_run_pieces,
+                answer_offset=offset,
+            )
+        else:
+            # 流式中断的一轮不进历史（本轮之前已修），改用 run 全文复读，
+            # 否则「再说一遍」会复读更早一轮的答案（内容错位）。
+            last = self._answer_run_text or (self.chat.turns[-1].assistant if self.chat.turns else "")
+            self._record("repeat", "reread", 0, chars=len(last), from_run=bool(self._answer_run_text))
+            await self._speak(last or "刚才没有可重复的内容。", kind="repeat")
         await self._after_answer_listen()
 
     async def _on_cancel(self, ev: events.CancelRequested) -> None:

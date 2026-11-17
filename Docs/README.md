@@ -9,7 +9,8 @@
 | 项目概览 | [根目录 README](../README.md) | 工程结构、配置和运行入口 |
 | 需求 | [功能流程说明](需求/视觉语言交互子系统功能流程说明.md) | 交互功能与业务流程 |
 | 需求 | [待确认清单](需求/视觉语言交互子系统待确认清单.md) | 待确认需求与技术事项 |
-| 方案 | [一次性执行提示词及完整方案](方案/DeepSeek-V4.1-Flash1017_一次性执行提示词_含完整方案.md) | 原有分阶段实施方案 |
+| 需求 | [待修复清单](需求/视觉语言交互子系统待修复清单.md) | 当前问题、修复状态与复验边界 |
+| 需求 | [无屏可用性走查（2026-11-16）](需求/无屏可用性走查_20261116.md) | 状态反馈、无屏任务走查、产品阻塞与真人待验项 |
 | 主控 | [项目背景与主线验收标准](MCPT/AI_Eyes项目背景与主线验收标准.md) | 项目背景及验收要求 |
 | 主控 | [主控与交互接口合同](MCPT/主控与交互接口合同.md) | 消息与接口约定 |
 | 测试台 | [测试台说明](../Testbench/README.md) | 组件、配置和软件检查 |
@@ -27,6 +28,8 @@
 - [本轮排查与验证](测试台/本轮排查与验证.md)
 - [本轮复测进度（2026-11-14）](测试台/本轮复测进度_20261114.md)
 - [定时恢复进度（2026-11-14）](测试台/定时恢复进度_20261114.md)
+- [同步复测与无屏整改记录（2026-11-16）](测试台/同步复测_20261116.md)
+- [v0.0.1 源码存档（2026-11-17）](../Testbench/Checkpoints/20261117_v0.0.1/RELEASE_v0.0.1.md)
 
 ## 目录迁移说明
 
@@ -34,10 +37,12 @@
 
 | 原路径 | 当前路径 |
 | --- | --- |
-| `config/`、`src/`、`tests/`、`tools/` | `Config/`、`Src/`、`Tests/`、`Tools/` |
+| `config/`、`src/`、`tests/`、`tools/` | `Config/`、`src/`、`Tests/`、`Tools/` |
 | `testbench/` | `Testbench/` |
 | `tests/unit/`、`tests/integration/`、`tests/fixtures/` | `Tests/Unit/`、`Tests/Integration/`、`Tests/Fixtures/` |
 | `NX-AI/models/`、`NX-AI/runtime/`、`NX-AI/tools/` | `NX-AI/Models/`、`NX-AI/Runtime/`、`NX-AI/Tools/` |
+
+> **`src/` 例外（2026-11-16 审查实测）**：产品源码目录盘上实际名就是**小写 `src/`**，与目标机一致；Windows 大小写不敏感，所以本机用 `Src/` 也能打开（`os.path.isdir` 两者皆真、`st_ino` 相同），**但 Linux 上不存在 `Src/`**。因此命令、`PYTHONPATH`、示例里一律写 `src/`；只有 `Config/`、`Tests/`、`Tools/`、`Testbench/` 这些确实是首字母大写的目录才写大写。
 | `Docs/` 下的功能说明与待确认清单 | `Docs/需求/` |
 | `Docs/` 下的 DeepSeek 完整方案 | `Docs/方案/` |
 | `testbench/` 下除 README 外的 Markdown 文档 | `Docs/测试台/` |

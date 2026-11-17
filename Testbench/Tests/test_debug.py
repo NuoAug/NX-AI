@@ -1,9 +1,9 @@
-"""Testbench/debug.py 的单元测试。
+"""testbench/debug.py 的单元测试。
 
 只使用 fake ctx、fake 业务组件和临时目录，不加载真实模型、不访问麦克风/
 扬声器/相机/网络。运行方式（仓库根目录、bundled Python）：
 
-    python -B -m unittest discover -s Testbench/Tests -p "test_debug.py" -v
+    python -B -m unittest discover -s testbench/tests -p "test_debug.py" -v
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-for _path in (_REPO_ROOT / "Testbench", _REPO_ROOT / "Src"):
+for _path in (_REPO_ROOT / "testbench", _REPO_ROOT / "src"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 

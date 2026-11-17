@@ -96,9 +96,9 @@
   function formatBytes(value) {
     if (typeof value !== 'number' || !isFinite(value) || value < 0) return '—';
     const mib = value / (1024 * 1024);
-    if (mib >= 1024) return (mib / 1024).toFixed(2) + ' GB';
-    if (mib >= 10) return Math.round(mib) + ' MB';
-    return mib.toFixed(1) + ' MB';
+    if (mib >= 1024) return (mib / 1024).toFixed(2) + ' GiB';
+    if (mib >= 10) return Math.round(mib) + ' MiB';
+    return mib.toFixed(1) + ' MiB';
   }
 
   function formatPercent(value) {
@@ -692,6 +692,12 @@
 
   function renderButtons() {
     const blocked = readOnly();
+    renderDeviceControls();
+    if (dom.claimControl) {
+      dom.claimControl.hidden = !app.connected || (app.owner && !app.controlLocked);
+      dom.claimControl.disabled = !app.connected || runIsActive() || debugIsActive() || app.previewActive;
+      dom.claimControl.title = dom.claimControl.disabled ? '请先在原控制页面停止测试或预览' : '将空闲测试台的控制权转到当前页面';
+    }
 
     const startEnabled = canStartRun();
     dom.start.disabled = !startEnabled;
@@ -759,7 +765,14 @@
     const detail = metrics && metrics.detail ? metrics.detail : {};
     const online = !!metrics;
 
-    dom.metrics.rss.textContent = online ? formatBytes(metrics.worker_rss_bytes) : '—';
+    const measuredParts = online ? [metrics.worker_rss_bytes, metrics.model_rss_bytes, metrics.bench_rss_bytes]
+      .filter(function (value) { return Number.isFinite(value) && value >= 0; }) : [];
+    const measuredTotal = measuredParts.reduce(function (sum, value) { return sum + value; }, 0);
+    // 三进程 RSS 合计只是参考值：不含子进程树、Swap 与 NvMap，共享映射可能重复计数。
+    // 不能据此判定 4 GiB 预算达标或超限；完整口径以 metrics.detail.memory 的三态与 verdict 为准。
+    const rssReferenceReady = online && Number.isFinite(metrics.model_rss_bytes) && Number.isFinite(metrics.bench_rss_bytes)
+      && (!(state.worker && state.worker.alive) || Number.isFinite(metrics.worker_rss_bytes));
+    dom.metrics.rss.textContent = rssReferenceReady ? formatBytes(measuredTotal) : '—';
     dom.metrics.cpu.textContent = online ? formatPercent(metrics.cpu_percent) : '—';
     dom.metrics.gpu.textContent = online ? formatPercent(metrics.gpu_percent) : '—';
     dom.metrics.temp.textContent = online ? formatTemperature(metrics.temperature_c) : '—';
@@ -768,17 +781,19 @@
     setBar(dom.metrics.barCpu, online ? clampPercent(metrics.cpu_percent) : null);
     setBar(dom.metrics.barGpu, online ? clampPercent(metrics.gpu_percent) : null);
 
-    let memoryShare = null;
-    if (online) {
-      const parts = [metrics.worker_rss_bytes, metrics.model_rss_bytes, metrics.bench_rss_bytes]
-        .filter(function (value) { return typeof value === 'number' && value > 0; });
-      const total = parts.reduce(function (sum, value) { return sum + value; }, 0);
-      if (total > 0 && typeof metrics.worker_rss_bytes === 'number') {
-        memoryShare = (metrics.worker_rss_bytes / total) * 100;
-      }
-    }
+    // 参考条形：仅表示三进程 RSS 参考值相对 4 GiB 上限的位置，不是完整占用，也不构成达标/超限结论。
+    const memoryShare = rssReferenceReady ? measuredTotal / (4 * 1024 * 1024 * 1024) * 100 : null;
     setBar(dom.metrics.barRss, memoryShare);
 
+    const memoryVerdict = detail.memory && detail.memory.verdict ? detail.memory.verdict : null;
+    const memoryStateText = {
+      undeterminable: '采样不完整，暂无法判断',
+      over_cap: '筛查结果超出 4 GiB，需核查原因',
+      within_cap_upper_bound_only: '保守上界在 4 GiB 内，仍需连续实机验收',
+      in_indeterminate_band: '结果处于不确定区间，需进一步核查'
+    };
+    const memorySummary = memoryVerdict && memoryStateText[memoryVerdict.state]
+      ? memoryStateText[memoryVerdict.state] : '暂无完整内存判定';
     const tooltip = [
       '交互 worker RSS：' + (online ? formatBytes(metrics.worker_rss_bytes) : '—'),
       '模型 RSS：' + (online ? formatBytes(metrics.model_rss_bytes) : '—'),
@@ -788,7 +803,8 @@
       '模型 CPU：' + (online ? formatPercent(detail.model_cpu_percent) : '—'),
       '测试台 CPU：' + (online ? formatPercent(detail.bench_cpu_percent) : '—'),
       'CPU 为全核归一化 0-100',
-      '内存条形为交互进程 RSS 占已测量进程 RSS 的比例，不是容量上限'
+      '内存为交互 worker、模型、测试台三个进程的 RSS 合计，仅是参考值：不含子进程树、Swap 与 NvMap，共享映射可能重复计数；不能据此判定 4 GiB 预算达标或超限，也不代表运行峰值。',
+      '完整内存：' + memorySummary
     ].join('\n');
     dom.metrics.rssRow.title = tooltip;
     dom.metrics.cpuRow.title = tooltip;
@@ -2170,6 +2186,7 @@
       stateTick();
       eventsTick();
       heartbeatTick();
+      loadDevices();
     } catch (err) {
       bootstrapFailures += 1;
       notePollFailure();
@@ -2390,10 +2407,70 @@
     });
   }
 
+  let deviceLoading = false;
+  let deviceSelected = { camera: '', microphone: '', speaker: '' };
+  const deviceIds = { camera: '#cameraDevice', microphone: '#microphoneDevice', speaker: '#speakerDevice' };
+  function renderDeviceControls() {
+    const busy = readOnly() || deviceLoading || runIsActive() || debugIsActive() || app.previewActive || app.pendingPreview || app.pendingRun;
+    Object.keys(deviceIds).forEach(function (key) { const node = $(deviceIds[key]); if (node) node.disabled = !!busy; });
+    const refresh = $('#refreshDevices'); if (refresh) refresh.disabled = !app.connected || deviceLoading || runIsActive() || debugIsActive() || app.previewActive;
+  }
+  async function loadDevices() {
+    deviceLoading = true; renderDeviceControls();
+    try {
+      const result = await request('/api/devices', {timeout: 15000});
+      deviceSelected = result.data.selected;
+      Object.keys(deviceIds).forEach(function (key) {
+        const select = $(deviceIds[key]); clearNode(select);
+        result.data.choices[key].forEach(function (item) { const opt = make('option', '', item.label); opt.value = item.id; opt.dataset.occupancy = item.occupancy || '状态未知'; select.appendChild(opt); });
+        if (!result.data.choices[key].some(function (item) { return item.id === deviceSelected[key]; })) {
+          const opt = make('option', '', '已选设备不可用'); opt.value = deviceSelected[key]; select.appendChild(opt);
+        }
+        select.value = deviceSelected[key];
+      });
+      $('#deviceMessage').textContent = (result.data.errors || []).join('；');
+    } catch (error) { $('#deviceMessage').textContent = error.message || '设备列表读取失败'; }
+    finally { deviceLoading = false; renderDeviceControls(); }
+  }
+  function wireDevices() {
+    $('#refreshDevices').addEventListener('click', loadDevices);
+    Object.keys(deviceIds).forEach(function (key) {
+      $(deviceIds[key]).addEventListener('change', async function () {
+        const next = Object.assign({}, deviceSelected); next[key] = this.value;
+        deviceLoading = true; renderDeviceControls();
+        try {
+          const result = await jsonPost('/api/devices', next, 15000);
+          deviceSelected = result.data.selected;
+          $('#deviceMessage').textContent = '已保存，下次启动生效';
+        } catch (error) {
+          $(deviceIds[key]).value = deviceSelected[key];
+          $('#deviceMessage').textContent = error.message || '设备切换失败';
+        } finally { deviceLoading = false; renderDeviceControls(); }
+      });
+    });
+  }
+
   function init() {
     if (dom.modelFrameMeta) dom.modelFrameMeta.textContent = '本轮实际输入';
     if (dom.debugOutput) dom.debugOutput.dataset.empty = '1';
+    dom.claimControl = make('button', '', '取得控制');
+    dom.claimControl.type = 'button';
+    dom.claimControl.hidden = true;
+    dom.conversationStatus.parentNode.insertBefore(dom.claimControl, dom.conversationStatus);
+    dom.claimControl.addEventListener('click', async function () {
+      try {
+        const result = await jsonPost('/api/client/claim', { request_id: makeRequestId() });
+        setOwner(result.data.owner);
+        app.controlLocked = false;
+        renderButtons();
+        showStatusMessage('当前页面已取得控制', 4000, 'progress');
+      } catch (err) {
+        dom.conversationStatus.textContent = err.message || '取得控制失败';
+      }
+    });
     wireEvents();
+    wireDevices();
+    setInterval(function(){if(app.connected && !deviceLoading && !document.querySelector('.device-options'))loadDevices();},5000);
     renderConversationPlaceholders();
     renderServices();
     renderRunState();
@@ -2413,4 +2490,80 @@
   } else {
     init();
   }
+})();
+
+// Multiline device menus retain the existing select/change API.
+(function () {
+  let opened = null;
+  function closeMenu(focus) {
+    if (!opened) return;
+    const item = opened; opened = null;
+    item.popup.remove(); item.button.setAttribute('aria-expanded', 'false');
+    if (focus) item.button.focus();
+  }
+  function setup() {
+    ['cameraDevice', 'microphoneDevice', 'speakerDevice'].forEach(function (id) {
+      const select = document.getElementById(id);
+      if (!select || select.dataset.multiline) return;
+      select.dataset.multiline = '1'; select.classList.add('device-native'); select.tabIndex = -1; select.setAttribute('aria-hidden', 'true');
+      const label = document.querySelector('label[for="' + id + '"]');
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'device-picker'; button.id = id + 'Picker';
+      button.setAttribute('aria-haspopup', 'listbox'); button.setAttribute('aria-expanded', 'false'); button.setAttribute('aria-controls', id + 'Options');
+      if (label) label.htmlFor = button.id;
+      const name = document.createElement('span'); name.className = 'device-name';
+      const arrow = document.createElement('span'); arrow.className = 'chevron'; arrow.textContent = '⌄'; arrow.setAttribute('aria-hidden', 'true'); button.append(name, arrow); select.after(button);
+      function sync() {
+        const option = select.options[select.selectedIndex];
+        // 列表没读到、或读到了但没选中时，不能伪装成已经选了“系统默认”。
+        const label = option ? option.textContent : (select.options.length ? '未选择设备' : '设备列表未读取');
+        name.textContent = label; button.title = label;
+        let status=button.nextElementSibling;
+        if(!status || !status.classList.contains('device-occupancy')){status=document.createElement('span');status.className='device-occupancy';button.after(status);}
+        status.textContent=option ? (option.dataset.occupancy || '状态未知') : (select.options.length ? '状态未知' : '占用未核实');status.title=status.textContent;
+        button.disabled = select.disabled;
+        button.setAttribute('aria-label', (label ? label.textContent : id) + '：' + name.textContent);
+        if (button.disabled && opened && opened.button === button) closeMenu(false);
+      }
+      function openMenu() {
+        if (button.disabled) return;
+        if (opened && opened.button === button) { closeMenu(true); return; }
+        closeMenu(false);
+        const popup = document.createElement('div'); popup.className = 'device-options'; popup.id = id + 'Options'; popup.setAttribute('role', 'listbox'); popup.setAttribute('aria-label', label ? label.textContent : '设备');
+        const rect = button.getBoundingClientRect(); const width = Math.min(Math.max(rect.width, 410), window.innerWidth - 24);
+        const below = window.innerHeight - rect.bottom - 12, above = rect.top - 12;
+        const down = below >= Math.min(260, above);
+        popup.style.width = width + 'px'; popup.style.left = Math.max(12, Math.min(rect.right - width, window.innerWidth - width - 12)) + 'px';
+        popup.style.maxHeight = Math.max(80, Math.min(340, down ? below : above)) + 'px';
+        if (down) popup.style.top = (rect.bottom + 4) + 'px'; else popup.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+        const options = Array.from(select.options);
+        options.forEach(function (option, index) {
+          const row = document.createElement('button'); row.type = 'button'; row.className = 'device-option'; row.textContent = option.textContent; row.title = option.textContent;
+          row.setAttribute('role', 'option'); row.setAttribute('aria-selected', String(index === select.selectedIndex)); row.tabIndex = -1;
+          row.addEventListener('click', function () { const changed = select.value !== option.value; select.value = option.value; sync(); closeMenu(true); if (changed) select.dispatchEvent(new Event('change', {bubbles:true})); });
+          row.addEventListener('keydown', function (event) {
+            const rows = Array.from(popup.children); let next = index;
+            if (event.key === 'ArrowDown') next = Math.min(rows.length - 1, index + 1);
+            else if (event.key === 'ArrowUp') next = Math.max(0, index - 1);
+            else if (event.key === 'Home') next = 0;
+            else if (event.key === 'End') next = rows.length - 1;
+            else if (event.key === 'Escape') {event.preventDefault();closeMenu(true);return;}
+            else if (event.key === 'Tab') {closeMenu(true);return;}
+            else return;
+            event.preventDefault(); rows[next].focus();
+          });
+          popup.appendChild(row);
+        });
+        document.body.appendChild(popup); opened = {popup:popup,button:button}; button.setAttribute('aria-expanded', 'true');
+        if (popup.children.length) popup.children[Math.max(0, select.selectedIndex)].focus();
+      }
+      button.addEventListener('click', openMenu);
+      button.addEventListener('keydown', function (event) {if(event.key === 'ArrowDown'||event.key === 'ArrowUp'){event.preventDefault();openMenu();}});
+      select.addEventListener('change', sync);
+      new MutationObserver(sync).observe(select, {attributes:true,childList:true,subtree:true}); sync();
+    });
+    document.addEventListener('pointerdown', function(event){if(opened&&!opened.popup.contains(event.target)&&!opened.button.contains(event.target))closeMenu(false);});
+    window.addEventListener('resize', function(){closeMenu(false);});
+    document.addEventListener('scroll', function(event){if(opened&&!opened.popup.contains(event.target))closeMenu(false);}, true);
+  }
+  if(document.readyState === 'loading')document.addEventListener('DOMContentLoaded',setup);else setup();
 })();

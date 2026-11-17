@@ -67,7 +67,7 @@ def wall_iso(ms: int | None = None) -> str:
 
 
 def load_bench_config() -> dict:
-    path = BENCH_DIR / "Config" / "bench.json"
+    path = BENCH_DIR / "config" / "bench.json"
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     if not isinstance(data, dict):
@@ -160,10 +160,42 @@ def check_model_health(bench: dict, *, timeout_s: float | None = None) -> tuple[
         return False, f"model_unavailable: {exc}"
 
 
+class DeviceUnavailable(RuntimeError):
+    """设备侧不可用（未连接/被占用/占用无法核实）：启动必须停在装配门口，不再往下走。"""
+
+
+def classify_start_error(exc: BaseException) -> BenchError:
+    """把启动期异常归到稳定错误码：设备类走 device_unavailable，其余仍是 engine_failed。"""
+    if isinstance(exc, DeviceUnavailable):
+        return BenchError("device_unavailable", f"设备不可用，未启动业务链路：{exc}")
+    return BenchError("engine_failed", f"业务链路启动失败：{exc}")
+
+
 def make_camera(cfg: Any) -> Any:
     """创建真实相机（测试通过 monkeypatch 本函数注入 fake）。"""
     from aieyes.vision.camera import V4L2Camera
 
+    from devices import require_available
+    device = cfg.vision.device
+    if not device:
+        raise RuntimeError("请明确选择本次测试摄像头，避免调用队友设备")
+    from devices import inventory
+    choices, _ = inventory()
+    if device not in {item['id'] for item in choices['camera'] if item['id']}:
+        # 设备不在清单是客观事实（不在设备类里），报 engine_failed 会让人以为是程序 bug。
+        # "未选设备"仍留 RuntimeError：那是配置选择错误，不是设备不可用。
+        raise DeviceUnavailable("所选摄像头不可用，请刷新设备列表；不会自动切换其他相机")
+    # 占用核实交给 devices.require_available：核实失败（fuser 缺失/超时）会如实说"无法核实"，
+    # 不再按"非空即被占用"误报，也不会把 {'pid': None, ...} 这样的内部结构拼进错误串。
+    try:
+        require_available(device, '摄像头')
+    except RuntimeError as exc:
+        raise DeviceUnavailable(str(exc)) from exc
+    from pathlib import Path
+    name = Path('/sys/class/video4linux') / Path(device).name / 'name'
+    if name.exists() and 'imx708' in name.read_text().lower():
+        from csi_camera import CsiCamera
+        return CsiCamera(device)
     return V4L2Camera(cfg.vision)
 
 
@@ -196,6 +228,7 @@ class RunSession:
         self._error: BenchError | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
+        self._model_cancel = threading.Event()
 
         self.bridge: Any = None
         self.evidence: Any = None
@@ -228,6 +261,7 @@ class RunSession:
     def request_stop(self, reason: str = "user") -> None:
         if self.cancel_reason == "":
             self.cancel_reason = reason
+        self._model_cancel.set()
         loop = self._loop
         event = self._stop_event
         if loop is not None and event is not None:
@@ -252,23 +286,37 @@ class RunSession:
     async def _main(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
+        if self._model_cancel.is_set():
+            self._stop_event.set()
         try:
+            if self._model_cancel.is_set():
+                return
             self._assemble()
+            if self._model_cancel.is_set():
+                return
             self.deps.sink.start()
             self._sink_started = True
+            if self._model_cancel.is_set():
+                return
             sample_rate = int(getattr(self.worker.cfg.audio, "sample_rate", 16000))
-            self.worker.audio_out = {"status": "ready", "detail": f"{sample_rate} Hz 默认输出"}
+            self.worker.audio_out = {"status": "ready", "detail": f"{sample_rate} Hz 输出"}
             await self.engine.start()
             self._engine_started = True
+            if self._model_cancel.is_set():
+                return
             contract = getattr(self.deps, "contract", None)
             if contract is not None:
                 result = contract.start()
                 if inspect.isawaitable(result):
                     await result
                 self._contract_started = True
+            if self._model_cancel.is_set():
+                return
             self.deps.frontend.start()
             self._frontend_started = True
-            self.worker.audio_in = {"status": "ready", "detail": f"{sample_rate} Hz 默认输入"}
+            if self._model_cancel.is_set():
+                return
+            self.worker.audio_in = {"status": "ready", "detail": f"{sample_rate} Hz 输入"}
             self.worker.emit_state(
                 {
                     "run": {
@@ -281,8 +329,10 @@ class RunSession:
                 }
             )
             self.worker.log("INFO", "worker", f"run {self.run_id} running")
+            self._ready.set()
+            await self._stop_event.wait()
         except Exception as exc:  # noqa: BLE001
-            self._error = BenchError("engine_failed", f"业务链路启动失败：{exc}")
+            self._error = classify_start_error(exc)
             if self.worker.audio_out.get("status") == "ready" and not self._frontend_started:
                 self.worker.audio_out = {"status": "error", "detail": str(exc)[:200]}
             if not self._frontend_started:
@@ -294,21 +344,35 @@ class RunSession:
             await self._cleanup()
 
     # --- 装配 -----------------------------------------------------------
+    def _emit_bridge_event(self, etype: str, turn_id: str | None, payload: dict) -> None:
+        """Bridge 的 emit：把本轮 run_id 绑进封套，收尾期间仍在飞的线程也不会漏到下一轮。"""
+        self.worker.emit_event(etype, turn_id, payload, run_id=self.run_id)
+
     def _assemble(self) -> None:
+        from intent_adapter import install
+        install()
+        from devices import require_audio
+        try:
+            require_audio('microphone')
+            require_audio('speaker')
+        except RuntimeError as exc:
+            # 设备不可用不是"业务链路启动失败"：分类后立即退出装配，
+            # 不进入 build_engine（半套对象跑起来只会报更乱的错）。
+            raise DeviceUnavailable(str(exc)) from exc
         from aieyes.app import _make_source, build_engine
         from aieyes.audio.output import AudioSink
-        from aieyes.audio.vad import EnergyVad
-        from aieyes.chat import ChatSession
+        from speech_vad import SpeechVad as EnergyVad
+        from chat_adapter import make_chat
         from aieyes.events import EventBus
         from aieyes.logging_setup import JsonlEvidenceLogger
         from aieyes.scene.providers import CameraFrameProvider
-        from aieyes.scene.service import SceneService
-        from aieyes.speech.asr import StreamingAsr
+        from scene_guard import SceneService
+        from asr_adapter import StreamingAsr
         from aieyes.speech.frontend import SpeechFrontend
-        from aieyes.speech.kws import SherpaKws
+        from kws_adapter import SherpaKws
         from aieyes.speech.tts import PiperTts
-        from aieyes.vision.ocr import OcrEngine
-        from aieyes.vision.vlm import VlmClient
+        from ocr_adapter import OcrEngine
+        from vlm_adapter import VlmClient
 
         from bridge import Bridge
         from media import CameraHubAdapter, FrameStore
@@ -323,7 +387,7 @@ class RunSession:
 
         self.frame_store = FrameStore(self.run_dir)
         self.bridge = Bridge(
-            self.worker.emit_event,
+            self._emit_bridge_event,
             run_id=self.run_id,
             frame_store=self.frame_store,
         )
@@ -334,11 +398,11 @@ class RunSession:
         self.provider = self.bridge.wrap_provider(
             CameraFrameProvider(camera=CameraHubAdapter(self.hub))
         )
-        self.vlm = VlmClient(cfg.llm, cfg.vlm)
+        self.vlm = VlmClient(cfg.llm, cfg.vlm, cancel_event=self._model_cancel)
         self.ocr = OcrEngine(cfg.ocr, ocr_dir=cfg.models.resolve(cfg.models.ocr_dir))
         self.scene = SceneService(vlm=self.vlm, ocr=self.ocr, provider=self.provider)
         observed_scene = self.bridge.wrap_scene(self.scene)
-        observed_chat = self.bridge.wrap_chat(ChatSession(self.vlm))
+        observed_chat = self.bridge.wrap_chat(make_chat(self.vlm))
         observed_tts = self.bridge.wrap_tts(PiperTts(cfg.tts, cfg.models))
         observed_evidence = self.bridge.wrap_evidence(self.evidence)
         sink = AudioSink(
@@ -366,8 +430,9 @@ class RunSession:
             frontend=frontend,
             bus=observed_bus,
         )
+        from types import SimpleNamespace
         self.engine = engine
-        self.deps = deps
+        self.deps = SimpleNamespace(**deps)
 
     # --- 清理 -----------------------------------------------------------
     async def _cleanup(self) -> None:
@@ -449,11 +514,7 @@ class RunSession:
     def _status(self) -> str:
         if self._error is not None:
             return "failed"
-        if self.cancel_reason in ("client_disconnected", "start_timeout", "shutdown"):
-            return "interrupted"
-        if self.cancel_reason == "":
-            return "completed"
-        return "completed"
+        return "interrupted" if self.cancel_reason else "completed"
 
     def _write_result(self, status: str, errors: list[str]) -> None:
         ended_ms = wall_ms()
@@ -527,14 +588,18 @@ class DebugContext:
         self.started_ms = wall_ms()
         self.frame_store = FrameStore(self.run_dir)
         self.bridge = Bridge(
-            worker.emit_event,
+            self._emit_bridge_event,
             run_id=self.run_id,
             frame_store=self.frame_store,
         )
 
     # --- 输出 -----------------------------------------------------------
+    def _emit_bridge_event(self, etype: str, turn_id: str | None, payload: dict) -> None:
+        """Bridge 的 emit：标签在会话构造时绑定，不随 worker 当前会话漂移。"""
+        self.worker.emit_event(etype, turn_id, payload, run_id=self.run_id)
+
     def emit(self, etype: str, payload: dict | None = None, turn_id: str | None = None) -> None:
-        self.worker.emit_event(etype, turn_id, payload or {})
+        self.worker.emit_event(etype, turn_id, payload or {}, run_id=self.run_id)
 
     def log(self, level: str, message: str) -> None:
         self.worker.log(level, "debug", message)
@@ -584,16 +649,16 @@ class DebugContext:
 
     # --- 组件 -----------------------------------------------------------
     def vlm_client(self) -> Any:
-        from aieyes.vision.vlm import VlmClient
+        from vlm_adapter import VlmClient
 
-        return VlmClient(self.cfg.llm, self.cfg.vlm)
+        return VlmClient(self.cfg.llm, self.cfg.vlm, cancel_event=self.stop_event)
 
     def scene_service(self, *, with_ocr: bool = True) -> Any:
-        from aieyes.scene.service import SceneService
+        from scene_guard import SceneService
 
         ocr = None
         if with_ocr:
-            from aieyes.vision.ocr import OcrEngine
+            from ocr_adapter import OcrEngine
 
             ocr = OcrEngine(self.cfg.ocr, ocr_dir=self.cfg.models.resolve(self.cfg.models.ocr_dir))
         return SceneService(vlm=self.vlm_client(), ocr=ocr)
@@ -681,11 +746,17 @@ class Worker:
         try:
             from aieyes.config import AppConfig
 
-            target = self.project_root / str(self.bench.get("target_config") or "Config/target.json")
+            target = self.project_root / str(self.bench.get("target_config") or "config/target.json")
             cfg = AppConfig.from_file(str(target))
             # 本轮覆盖：写入路径全部重定向到测试台，不使用正式设备配置
-            cfg.audio.input_device = None
-            cfg.audio.output_device = None
+            from devices import apply as apply_devices
+            apply_devices(cfg)
+            # 自然说话常在句中断顿；1.2s 静音再收尾，避免把“眼前有什么”切成
+            # “眼前要是忙”之类的半句。preroll 加长保护首字。
+            cfg.vad.min_silence_ms=1200
+            cfg.vad.preroll_ms=500
+            from kws_adapter import configure_kws
+            configure_kws(cfg)
             self.cfg = cfg
         except Exception as exc:  # noqa: BLE001
             self.cfg_error = f"config_unavailable: {exc}"
@@ -742,16 +813,34 @@ class Worker:
     def emit_state(self, patch: dict) -> None:
         emit_message({"t": "state", "patch": patch})
 
-    def emit_event(self, etype: str, turn_id: str | None, payload: dict) -> None:
+    def _active_run_id(self) -> str:
+        """当前事件属于哪一轮会话：调试优先，其次综合测试；都没有则为空。
+
+        bridge.py 的 EmitFn 契约要求 worker 侧补 run_id，server 据此丢弃上一轮的迟到事件。
+        """
+        session = getattr(self, "debug", None) or getattr(self, "run", None)
+        return str(getattr(session, "run_id", "") or "")
+
+    def emit_event(
+        self,
+        etype: str,
+        turn_id: str | None,
+        payload: dict,
+        *,
+        run_id: str | None = None,
+    ) -> None:
         if etype == "timing":
             for key, value in payload.items():
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     self.timings[key] = value
+        if run_id is None:
+            run_id = self._active_run_id()
         emit_message(
             {
                 "t": "event",
                 "event": {
                     "type": str(etype),
+                    "run_id": str(run_id or ""),
                     "turn_id": turn_id,
                     "payload": payload,
                     "ts_mono_ms": mono_ms(),
@@ -946,8 +1035,9 @@ class Worker:
                 "error",
                 None,
                 {"code": "engine_failed", "message": "综合测试未能完成", "retryable": True},
+                run_id=session.run_id,
             )
-        self._schedule_exit("run_finished")
+        # server._watch_worker_exit reclaims an idle worker after five seconds.
 
     # --- preview --------------------------------------------------------
     def _cmd_preview_start(self, args: dict) -> dict:
@@ -1040,8 +1130,8 @@ class Worker:
             debug_run = self.debug
         if debug_run is None:
             return {"status": "idle"}
-        debug_run.stop()
         self.emit_state({"debug": {"run_id": debug_run.run_id, "module": debug_run.module, "status": "stopping"}})
+        debug_run.stop()
         return {"run_id": debug_run.run_id, "status": "stopping"}
 
     def _cmd_debug_action(self, args: dict) -> dict:
@@ -1062,8 +1152,10 @@ class Worker:
 
     def on_debug_finished(self, debug_run: DebugRun, status: str, error: str = "") -> None:
         with self.lock:
-            if self.debug is debug_run:
+            if self.debug is debug_run or getattr(self.debug, "ctx", None) is debug_run:
                 self.debug = None
+            else:
+                return
         patch = {
             "debug": {
                 "module": debug_run.module,

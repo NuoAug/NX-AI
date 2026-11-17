@@ -56,6 +56,10 @@ class PlaybackFinished:
     total_ms: int
     cancelled: bool = False
     text: str = ""
+    #: 未播完的原因（``playback_stalled`` / ``user_cancel`` / ``interrupted`` 等）；
+    #: 正常播完为 ``""``。引擎与 sink 用同一字符串上报，``cancelled`` 布尔分不出
+    #: 「卡死」与「用户主动取消」，需要区分时读这个字段。
+    stop_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,7 +5,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 BENCH_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 RUNTIME_DIR="${BENCH_DIR}/.runtime"
-PORT="$(python3 - "${BENCH_DIR}/Config/bench.json" <<'PY' 2>/dev/null || true
+BENCH_CONFIG="${BENCH_DIR}/Config/bench.json"
+if [ ! -f "${BENCH_CONFIG}" ]; then
+  BENCH_CONFIG="${BENCH_DIR}/config/bench.json"
+fi
+if [ ! -f "${BENCH_CONFIG}" ]; then
+  BENCH_CONFIG=""
+fi
+PORT="$(python3 - "${BENCH_CONFIG}" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as fh:
@@ -14,6 +21,9 @@ except Exception:
     print(18780)
 PY
 )"
+if [ -z "${BENCH_CONFIG}" ]; then
+  echo "warn: 未找到 bench.json（Config/bench.json 与 config/bench.json 均缺失），停止端口使用默认值 18780" >&2
+fi
 PORT="${PORT:-18780}"
 HOST="127.0.0.1"
 
@@ -24,14 +34,25 @@ pid_start_ticks() {
 }
 
 owned_process() {
-  local pid="$1" ticks="$2" argv="$3"
+  local pid="$1" ticks="$2"
+  shift 2
   [ -n "${pid}" ] || return 1
   [ -n "${ticks}" ] || return 1
   [ -d "/proc/${pid}" ] || return 1
   local now
   now="$(pid_start_ticks "${pid}")"
   [ "${now}" = "${ticks}" ] || return 1
-  tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Fq -- "${argv}" || return 1
+  # 命令匹配接受多种拼写（本机 Testbench/，目标板 testbench/）：任一命中即算归属
+  local cmdline
+  cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+  [ -n "${cmdline}" ] || return 1
+  local pattern hit=1
+  for pattern in "$@"; do
+    if printf '%s' "${cmdline}" | grep -Fq -- "${pattern}"; then
+      hit=0
+    fi
+  done
+  [ "${hit}" -eq 0 ] || return 1
   return 0
 }
 
@@ -47,8 +68,9 @@ PY
 }
 
 kill_owned() {
-  local label="$1" pid="$2" ticks="$3" argv="$4" grace="${5:-10}"
-  if ! owned_process "${pid}" "${ticks}" "${argv}"; then
+  local label="$1" pid="$2" ticks="$3" grace="${4:-10}"
+  shift 4
+  if ! owned_process "${pid}" "${ticks}" "$@"; then
     echo "skip ${label}: pid ${pid} 归属校验未通过（不存在、启动时间变化或命令不匹配）"
     return 0
   fi
@@ -60,7 +82,7 @@ kill_owned() {
     waited=$((waited + 1))
   done
   if [ -d "/proc/${pid}" ]; then
-    if owned_process "${pid}" "${ticks}" "${argv}"; then
+    if owned_process "${pid}" "${ticks}" "$@"; then
       echo "force kill ${label}: pid ${pid}"
       kill -KILL "${pid}" 2>/dev/null || true
     else
@@ -73,7 +95,7 @@ kill_owned() {
 SERVER_PID_FILE="${RUNTIME_DIR}/server.pid"
 if read_pid_file "${SERVER_PID_FILE}" >/dev/null 2>&1; then
   read -r SERVER_PID SERVER_TICKS < <(read_pid_file "${SERVER_PID_FILE}")
-  kill_owned "server" "${SERVER_PID}" "${SERVER_TICKS}" "Testbench/server.py" 15
+  kill_owned "server" "${SERVER_PID}" "${SERVER_TICKS}" 15 "Testbench/server.py" "testbench/server.py"
   rm -f "${SERVER_PID_FILE}"
 else
   echo "server pid 文件不存在：${SERVER_PID_FILE}"
@@ -83,7 +105,7 @@ fi
 WORKER_PID_FILE="${RUNTIME_DIR}/worker.json"
 if read_pid_file "${WORKER_PID_FILE}" >/dev/null 2>&1; then
   read -r WORKER_PID WORKER_TICKS < <(read_pid_file "${WORKER_PID_FILE}")
-  kill_owned "worker" "${WORKER_PID}" "${WORKER_TICKS}" "Testbench/worker.py" 10
+  kill_owned "worker" "${WORKER_PID}" "${WORKER_TICKS}" 10 "Testbench/worker.py" "testbench/worker.py"
   rm -f "${WORKER_PID_FILE}"
 fi
 

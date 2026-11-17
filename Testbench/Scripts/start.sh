@@ -6,16 +6,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 BENCH_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 PROJECT_ROOT="$(cd "${BENCH_DIR}/.." && pwd -P)"
 
-# 核对真实绝对路径：测试台必须在项目根下的 Testbench/ 内
+# 核对真实绝对路径：测试台必须在项目根下的 Testbench/（目标板为 testbench/）内
 case "${BENCH_DIR}" in
-  "${PROJECT_ROOT}/Testbench") ;;
+  "${PROJECT_ROOT}/Testbench" | "${PROJECT_ROOT}/testbench") ;;
   *)
     echo "error: 测试台目录不在 <项目根>/testbench 内: ${BENCH_DIR}" >&2
     exit 1
     ;;
 esac
 
-PORT="$(python3 - "${BENCH_DIR}/Config/bench.json" <<'PY' 2>/dev/null || true
+BENCH_CONFIG="${BENCH_DIR}/Config/bench.json"
+if [ ! -f "${BENCH_CONFIG}" ]; then
+  BENCH_CONFIG="${BENCH_DIR}/config/bench.json"
+fi
+if [ ! -f "${BENCH_CONFIG}" ]; then
+  BENCH_CONFIG=""
+fi
+PORT="$(python3 - "${BENCH_CONFIG}" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as fh:
@@ -24,6 +31,9 @@ except Exception:
     print(18780)
 PY
 )"
+if [ -z "${BENCH_CONFIG}" ]; then
+  echo "warn: 未找到 bench.json（Config/bench.json 与 config/bench.json 均缺失），启动端口使用默认值 18780" >&2
+fi
 PORT="${PORT:-18780}"
 HOST="127.0.0.1"
 PYTHON="${BENCH_DIR}/../.venv/bin/python"
@@ -37,7 +47,7 @@ for dir in "${BENCH_DIR}/runs" "${BENCH_DIR}/uploads" "${RUNTIME_DIR}" "${LOGS_D
   mkdir -p "${dir}"
 done
 
-export PYTHONPATH="${PROJECT_ROOT}/Src"
+export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}/Src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
 export XDG_CACHE_HOME="${RUNTIME_DIR}/cache"

@@ -15,12 +15,14 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import deque
 from typing import Callable
 
 import numpy as np
 
+from aieyes.clock import mono_ms
 from aieyes.config import VadConfig
 from aieyes.interfaces import (
     SAMPLE_RATE,
@@ -71,6 +73,19 @@ class SpeechFrontend:
         self._in_speech = False
         self._preroll: deque[AudioFrame] = deque(maxlen=max(1, int(round(self.preroll_ms / 20))))
         self._frames = 0
+        # 尾音误触发保护：真人录音里句尾低电平噪声会被能量 VAD 当成第二段，
+        # 再被 ASR  hallucinate 成“不东西”。这里只丢弃“明显低于本次说话电平、
+        # 很短、且没有可执行短词”的尾段，不按固定绝对阈值误杀轻声说话。
+        self._level_history: deque[float] = deque(maxlen=5)
+        self._speech_rms_ref = 0.0
+        #: 被当作尾音噪声丢弃的段数（可观测，不参与播报）。
+        self.dropped_low_energy = 0
+        # 有界续接：句末是明确连接词时，等一个短停顿再提交；避免自然停顿被
+        # 拆成两轮（“重拍第一件，然后……只比较价格”）。只等一次，超时必提交。
+        self._continuation_grace_ms = 700
+        self._pending_segment: SpeechSegment | None = None
+        self._pending_text = ""
+        self._pending_until_ms = 0
 
     # ------------------------------------------------------------------
     @property
@@ -97,6 +112,10 @@ class SpeechFrontend:
             self._in_speech = False
             self._preroll.clear()
             self._frames = 0
+            self._level_history.clear()
+            self._speech_rms_ref = 0.0
+            self.dropped_low_energy = 0
+            self._clear_pending()
             if self.vad is not None:
                 self.vad.reset()
             if self.asr is not None:
@@ -190,6 +209,9 @@ class SpeechFrontend:
         self._asr_active = False
         self._in_speech = False
         self._preroll.clear()
+        self._level_history.clear()
+        self._speech_rms_ref = 0.0
+        self._clear_pending()
 
     # ------------------------------------------------------------------
     def _on_frame(self, frame: AudioFrame) -> None:
@@ -220,32 +242,173 @@ class SpeechFrontend:
                 return actions
 
             if not listening or self.vad is None or self.asr is None:
+                self._clear_pending()
+                return actions
+
+            # 有界续接的等待超时：用户没有再说，按已识别文本提交，不能无限等。
+            if (self._pending_segment is not None
+                    and not self.vad.in_speech
+                    and int(frame.t_start_ms) >= self._pending_until_ms):
+                utt = self._flush_pending_locked()
+                if utt is not None:
+                    actions.append(("utterance", utt))
                 return actions
 
             segment: SpeechSegment | None = self.vad.accept(frame)
             if bool(self.vad.in_speech) and not self._in_speech:
                 self._in_speech = True
                 actions.append(("speech_start", int(frame.t_start_ms)))
-                self._begin_asr_locked(actions)
+                if self._pending_segment is None:
+                    self._begin_asr_locked(actions)
+                # 续接：同一个 ASR 流继续喂，不重建、不丢前半句。
             elif self._asr_active:
                 partial = self.asr.accept(frame)
                 if partial:
                     actions.append(("partial", partial, int(frame.t_start_ms)))
 
             if segment is not None:
+                self._in_speech = False
                 if self._asr_active:
+                    if self._pending_segment is not None:
+                        # 停顿期间又说了：把两段并成一次话轮提交。
+                        utt = self.asr.finalize()
+                        self._asr_active = False
+                        merged = self._merge_pending_locked(segment)
+                        text = utt.text or self._pending_text
+                        self._clear_pending()
+                        level = _segment_rms(merged.samples)
+                        self._note_speech_level(level)
+                        actions.append(("utterance", Utterance(
+                            text=text,
+                            t_audio_start_ms=int(merged.t_start_ms),
+                            t_audio_end_ms=int(merged.t_end_ms),
+                            t_final_ms=int(utt.t_final_ms),
+                            samples=merged.samples,
+                        )))
+                        return actions
+                    preview = self._asr_preview()
+                    if self._should_wait_for_more(segment, preview):
+                        self._pending_segment = segment
+                        self._pending_text = preview or ""
+                        self._pending_until_ms = (
+                            int(segment.t_end_ms) + int(self._continuation_grace_ms)
+                        )
+                        return actions
                     utt = self.asr.finalize()
                     self._asr_active = False
+                    samples = np.asarray(segment.samples, dtype=np.float32)
+                    level = _segment_rms(samples)
+                    if self._looks_like_tail_noise(segment, level, utt.text):
+                        self.dropped_low_energy += 1
+                        return actions
+                    self._note_speech_level(level)
                     utt = Utterance(
                         text=utt.text,
                         t_audio_start_ms=int(segment.t_start_ms),
                         t_audio_end_ms=int(segment.t_end_ms),
                         t_final_ms=int(utt.t_final_ms),
-                        samples=np.asarray(segment.samples, dtype=np.float32),
+                        samples=samples,
                     )
                     actions.append(("utterance", utt))
-                self._in_speech = False
             return actions
+
+    # 短词白名单：即便电平偏低、时长很短，也可能是有效指令，不能当尾音丢掉。
+    _SHORT_MEANINGFUL = frozenset(
+        {
+            "嗯", "嗯嗯", "好", "好的", "行", "对", "可以", "继续", "接着",
+            "停", "停止", "停下", "重拍", "重来", "换一个", "开麦", "关麦",
+            "静音", "清空", "取消", "算了", "不用", "不要", "第一个", "第二个",
+            "好了", "不是", "是的",
+        }
+    )
+
+    def _looks_like_tail_noise(self, segment: SpeechSegment, level: float, text: str) -> bool:
+        """句尾低电平假段：明显低于本次说话电平、很短、且不是有效短词。"""
+        reference = self._speech_rms_ref
+        if reference <= 0 or segment.cause != "vad_end":
+            return False
+        duration = int(segment.t_end_ms) - int(segment.t_start_ms)
+        if duration >= 1500 or level >= 0.45 * reference:
+            return False
+        core = re.sub(r"[\s，。！？!?、,.；;：:]+", "", text or "")
+        return 0 < len(core) <= 4 and core not in self._SHORT_MEANINGFUL
+
+    def _note_speech_level(self, level: float) -> None:
+        if level <= 0:
+            return
+        self._level_history.append(level)
+        ordered = sorted(self._level_history)
+        self._speech_rms_ref = ordered[len(ordered) // 2]
+
+    #: 只有句末是明确连接词时才等短停顿；普通陈述不能因为一个“了/的”多等。
+    _CONTINUATION_ENDINGS = (
+        "然后", "还有", "但是", "因为", "所以", "如果", "或者", "以及",
+        "并且", "而且", "接着", "不过", "那么", "比如说", "比如", "就是",
+    )
+
+    def _asr_preview(self) -> str | None:
+        """当前流结果（不结束、不重置）；ASR 实现不支持时返回 None。"""
+        preview = getattr(self.asr, "result", None)
+        if not callable(preview):
+            return None
+        try:
+            return str(preview() or "")
+        except Exception:  # noqa: BLE001 - 预览失败不影响正常收尾
+            return None
+
+    def _should_wait_for_more(self, segment: SpeechSegment, preview: str | None) -> bool:
+        if preview is None or segment.cause != "vad_end":
+            return False
+        if int(segment.t_end_ms) - int(segment.t_start_ms) >= 8000:
+            return False
+        core = re.sub(r"[\s，。！？!?、,.；;：:]+", "", preview)
+        return len(core) >= 2 and any(core.endswith(word) for word in self._CONTINUATION_ENDINGS)
+
+    def _merge_pending_locked(self, second: SpeechSegment) -> SpeechSegment:
+        first = self._pending_segment
+        assert first is not None
+        overlap_ms = max(0, int(first.t_end_ms) - int(second.t_start_ms))
+        drop = min(len(second.samples), int(overlap_ms * self.sample_rate / 1000))
+        samples = np.concatenate(
+            [
+                np.asarray(first.samples, dtype=np.float32),
+                np.asarray(second.samples, dtype=np.float32)[drop:],
+            ]
+        )
+        return SpeechSegment(
+            samples=samples,
+            t_start_ms=int(first.t_start_ms),
+            t_end_ms=int(second.t_end_ms),
+            cause="continuation",
+        )
+
+    def _flush_pending_locked(self) -> Utterance | None:
+        pending = self._pending_segment
+        if pending is None:
+            return None
+        text = self._pending_text
+        t_final = mono_ms()
+        if self._asr_active:
+            utt = self.asr.finalize()
+            self._asr_active = False
+            if utt.text:
+                text = utt.text
+            t_final = int(utt.t_final_ms)
+        samples = np.asarray(pending.samples, dtype=np.float32)
+        self._clear_pending()
+        self._note_speech_level(_segment_rms(samples))
+        return Utterance(
+            text=text,
+            t_audio_start_ms=int(pending.t_start_ms),
+            t_audio_end_ms=int(pending.t_end_ms),
+            t_final_ms=t_final,
+            samples=samples,
+        )
+
+    def _clear_pending(self) -> None:
+        self._pending_segment = None
+        self._pending_text = ""
+        self._pending_until_ms = 0
 
     def _begin_asr_locked(self, actions: list[tuple]) -> None:
         """VAD 确认开口：新建 ASR 片段并把 preroll 补喂进去（首字保护）。"""
@@ -282,3 +445,9 @@ class SpeechFrontend:
 
 
 __all__ = ["SpeechFrontend"]
+
+
+def _segment_rms(samples: np.ndarray) -> float:
+    if not samples.size:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(samples))))

@@ -16,7 +16,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BENCH = HERE.parent
-SRC = BENCH.parent / "Src"
+SRC = BENCH.parent / "src"
 WORKER = BENCH / "worker.py"
 
 
